@@ -3,10 +3,10 @@ import tilelang
 import tilelang.language as T
 from tilelang.profiler import do_bench
 import argparse
-from fla.ops.linear_attn import fused_chunk_linear_attn  # We compare with FLA
-from fla.modules.l2norm import l2norm_fwd
 from einops import rearrange
 from typing import Optional, Tuple
+from fla.ops.linear_attn import fused_chunk_linear_attn
+from fla.modules.l2norm import l2norm_fwd
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -159,6 +159,8 @@ def main(B=1, S=1024, H=16, D=128):
     # qk norm is necessary for linear attn
     q = l2norm_fwd(q)[0].requires_grad_(True)
     k = l2norm_fwd(k)[0].requires_grad_(True)
+    q.retain_grad()
+    k.retain_grad()
 
     dq, dk, dv = tl_fused_chunk_bwd(q, k, v, do)
     q.grad = k.grad = v.grad = None

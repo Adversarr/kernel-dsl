@@ -2,6 +2,7 @@ import tilelang.language as T
 from typing import Literal, Callable
 from tvm.tirx import IndexMap
 from tilelang.rocm.intrinsics.utils import get_mma_micro_size
+from tilelang.tools import plot_layout
 
 from tilelang.rocm.intrinsics.mfma_layout import (
     shared_16x4_to_local_64x1_layout_A,
@@ -108,8 +109,6 @@ block_cols = 2
 warp_rows = 2
 warp_cols = 2
 chunk = 2
-
-from tilelang.tools import plot_layout
 
 # ldmatrix layout 16x16
 base_layout = make_mfma_load_base_layout(dtype=T.float16, matrix="A", transposed=False)

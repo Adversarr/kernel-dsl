@@ -1,6 +1,8 @@
+import os
 import torch
 import tilelang
 import tilelang.language as T
+from pathlib import Path
 
 
 def fast_log2_ceil(x):
@@ -19,6 +21,21 @@ def fast_pow2(x):
 
 def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
+
+
+def has_fp4_runtime_support() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    sm_major, _ = torch.cuda.get_device_capability()
+    if sm_major < 10:
+        return False
+    cuda_roots = []
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_root = os.environ.get(env_name)
+        if cuda_root:
+            cuda_roots.append(Path(cuda_root))
+    cuda_roots.append(Path("/usr/local/cuda"))
+    return any((root / "include" / "cuda_fp4.h").exists() for root in cuda_roots)
 
 
 @tilelang.jit(
@@ -323,6 +340,9 @@ def test_fp8_act_quant(M: int = 256, N: int = 1024, block_size: int = 128):
 
 def test_fp4_act_quant(M: int = 256, N: int = 1024, block_size: int = 32):
     """Test FP4 act quant: tilelang vs PyTorch reference via dequantized comparison."""
+    if not has_fp4_runtime_support():
+        print("Skipping FP4 act quant test: FP4 requires SM100+ and a CUDA toolkit with cuda_fp4.h.")
+        return
     torch.random.manual_seed(42)
     x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
 
@@ -368,11 +388,14 @@ def test_round_trip_error():
     assert fp8_mse < 1.0, f"FP8 round-trip MSE too high: {fp8_mse}"
 
     # FP4 round-trip
-    quant_fp4, scale_fp4 = fp4_act_quant(x, block_size=32)
-    recovered_fp4 = fp4_dequant_to_float(quant_fp4, scale_fp4, 512)
-    fp4_mse = torch.nn.functional.mse_loss(recovered_fp4, x_float).item()
-    print(f"  FP4 round-trip MSE: {fp4_mse:.6f}")
-    assert fp4_mse < 10.0, f"FP4 round-trip MSE too high: {fp4_mse}"
+    if has_fp4_runtime_support():
+        quant_fp4, scale_fp4 = fp4_act_quant(x, block_size=32)
+        recovered_fp4 = fp4_dequant_to_float(quant_fp4, scale_fp4, 512)
+        fp4_mse = torch.nn.functional.mse_loss(recovered_fp4, x_float).item()
+        print(f"  FP4 round-trip MSE: {fp4_mse:.6f}")
+        assert fp4_mse < 10.0, f"FP4 round-trip MSE too high: {fp4_mse}"
+    else:
+        print("  FP4 round-trip skipped: FP4 requires SM100+ and a CUDA toolkit with cuda_fp4.h.")
 
     print("[PASS] test_round_trip_error")
 

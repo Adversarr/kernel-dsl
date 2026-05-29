@@ -121,6 +121,20 @@ def make_dq_layout(dQ):
     return T.Layout(dQ.shape, lambda b, l, h, d: [b, l // 8, h, d // 8, (d % 2), 4 * (l % 8) + (d % 8) // 2])
 
 
+def get_bwd_runtime_config():
+    sm_major, _ = torch.cuda.get_device_capability()
+    if sm_major >= 9:
+        return dict(block_M=128, block_N=32, threads=256, num_stages=2, prefer_atomic=True)
+    return dict(block_M=32, block_N=32, threads=128, num_stages=1, prefer_atomic=True)
+
+
+def has_supported_gqa_bwd_runtime():
+    if not torch.cuda.is_available():
+        return False
+    sm_major, _ = torch.cuda.get_device_capability()
+    return sm_major >= 9
+
+
 @tilelang.jit(
     out_idx=[1],
     pass_configs={
@@ -366,15 +380,30 @@ class _attention(torch.autograd.Function):
             return x
 
         do, q, k, v, o = [maybe_contiguous(x) for x in (do, q, k, v, o)]
-        block_M = 128
-        block_N = 32
+        runtime_config = get_bwd_runtime_config()
+        block_M = runtime_config["block_M"]
+        block_N = runtime_config["block_N"]
+        threads = runtime_config["threads"]
+        num_stages = runtime_config["num_stages"]
         mod_prep = flashattn_bwd_preprocess(BATCH, H, N_CTX, D_HEAD_V)
         mod_post = flashattn_bwd_postprocess(BATCH, H, N_CTX, D_HEAD_QK)
         delta = mod_prep(o, do)
 
-        if ctx.use_atomic:
+        use_atomic = ctx.use_atomic and runtime_config["prefer_atomic"]
+
+        if use_atomic:
             kernel = flashattn_bwd_atomic_add(
-                BATCH, H, N_CTX, D_HEAD_QK, D_HEAD_V, ctx.causal, block_M, block_N, threads=256, num_stages=2, groups=groups
+                BATCH,
+                H,
+                N_CTX,
+                D_HEAD_QK,
+                D_HEAD_V,
+                ctx.causal,
+                block_M,
+                block_N,
+                threads=threads,
+                num_stages=num_stages,
+                groups=groups,
             )
             shape_q = [BATCH, N_CTX, H, D_HEAD_QK]
             shape_k = [BATCH, N_CTX, HEAD_KV, D_HEAD_QK]
@@ -388,7 +417,17 @@ class _attention(torch.autograd.Function):
             dv = dv.to(torch.float16)
         else:
             kernel = flashattn_bwd_split(
-                BATCH, H, N_CTX, D_HEAD_QK, D_HEAD_V, ctx.causal, block_M, block_N, threads=256, num_stages=2, groups=groups
+                BATCH,
+                H,
+                N_CTX,
+                D_HEAD_QK,
+                D_HEAD_V,
+                ctx.causal,
+                block_M,
+                block_N,
+                threads=threads,
+                num_stages=num_stages,
+                groups=groups,
             )
             shape_q = [BATCH, N_CTX, H, D_HEAD_QK]
             shape_k = [groups, BATCH, N_CTX, HEAD_KV, D_HEAD_QK]  # sum after kernel
@@ -439,6 +478,10 @@ def main(
     causal: bool = False,
     use_atomic: bool = True,
 ):
+    if not has_supported_gqa_bwd_runtime():
+        print("Skipping GQA backward example: this kernel currently requires SM90+ on this TileLang build.")
+        return
+
     flops_per_qk = 2.0 * BATCH * H * N_CTX * N_CTX * D_HEAD_QK
     flops_per_v = 2.0 * BATCH * H * N_CTX * N_CTX * D_HEAD_V
     total_flops = 3 * flops_per_qk + 2 * flops_per_v

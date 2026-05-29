@@ -1,4 +1,5 @@
 # ruff: noqa
+import math
 import torch
 from einops import rearrange, repeat
 from bert_padding import pad_input, unpad_input
@@ -106,3 +107,45 @@ def generate_qkv(q, k, v, query_padding_mask=None, key_padding_mask=None, kvpack
             dq_pad_fn,
             dk_pad_fn,
         )
+
+
+def padded_varlen_attention_reference(q, k, v, query_padding_mask=None, key_padding_mask=None, causal=False, groups=1):
+    batch_size, seqlen_q, q_heads, dim = q.shape
+    _, seqlen_k, kv_heads, _ = k.shape
+    assert q_heads == kv_heads * groups, f"Expected q_heads == kv_heads * groups, got {q_heads}, {kv_heads}, {groups}"
+
+    output = torch.zeros_like(q)
+    scale = 1.0 / math.sqrt(dim)
+
+    for batch_idx in range(batch_size):
+        q_len = int(query_padding_mask[batch_idx].sum().item()) if query_padding_mask is not None else seqlen_q
+        k_len = int(key_padding_mask[batch_idx].sum().item()) if key_padding_mask is not None else seqlen_k
+        if q_len == 0 or k_len == 0:
+            continue
+
+        q_valid = q[batch_idx, :q_len].float()
+        k_valid = k[batch_idx, :k_len].float()
+        v_valid = v[batch_idx, :k_len].float()
+
+        if groups != 1:
+            k_valid = k_valid.repeat_interleave(groups, dim=1)
+            v_valid = v_valid.repeat_interleave(groups, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q_valid, k_valid) * scale
+        if causal:
+            q_positions = torch.arange(q_len, device=q.device)
+            k_positions = torch.arange(k_len, device=q.device)
+            offset = k_len - q_len
+            causal_mask = (q_positions[:, None] + offset) >= k_positions[None, :]
+            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+            visible_rows = causal_mask.any(dim=1)
+            scores = torch.where(visible_rows.view(1, q_len, 1), scores, torch.zeros_like(scores))
+        else:
+            visible_rows = None
+
+        attn = torch.softmax(scores, dim=-1)
+        if visible_rows is not None:
+            attn = torch.where(visible_rows.view(1, q_len, 1), attn, torch.zeros_like(attn))
+        output[batch_idx, :q_len] = torch.einsum("hqk,khd->qhd", attn, v_valid).to(q.dtype)
+
+    return output

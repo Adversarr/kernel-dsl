@@ -13,6 +13,13 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 
+def has_tma_runtime_support():
+    if not torch.cuda.is_available():
+        return False
+    sm_major, _ = torch.cuda.get_device_capability()
+    return sm_major >= 9
+
+
 @tilelang.jit(out_idx=[3])
 def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_size):
     block_M = 64
@@ -559,6 +566,10 @@ def sum_all_diagonal_matrix(mat: torch.tensor):
 
 
 def main(batch=1, heads=1, seq_len=4096, head_dim=64, vertical_size=1000, slash_size=200):
+    if not has_tma_runtime_support():
+        print("Skipping TileLang minference example: this kernel requires SM90+ TMA support.")
+        return
+
     BATCH, N_HEADS, SEQ_LEN, D_HEAD = batch, heads, seq_len, head_dim
 
     vertical_size, slash_size = vertical_size, slash_size

@@ -68,6 +68,11 @@ def ref_program(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return x_fp8, (x_amax / 448.0).view(m, -1)
 
 
+def _can_run_triton_fp8_benchmark() -> bool:
+    sm_major, _ = torch.cuda.get_device_capability()
+    return sm_major >= 9
+
+
 def main(M=8192, N=8192, blk_m=8):
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
 
@@ -102,8 +107,11 @@ def main(M=8192, N=8192, blk_m=8):
     print("Ref: {:.2f} ms".format(latency))
     latency = do_bench(run_tilelang)
     print("Tile-lang: {:.2f} ms".format(latency))
-    latency = do_bench(run_triton)
-    print("Triton: {:.2f} ms".format(latency))
+    if _can_run_triton_fp8_benchmark():
+        latency = do_bench(run_triton)
+        print("Triton: {:.2f} ms".format(latency))
+    else:
+        print("Triton benchmark skipped: this GPU does not support the requested FP8 Triton dtype.")
 
 
 def run_regression_perf(M=8192, N=8192, blk_m=8):

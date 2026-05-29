@@ -11,8 +11,19 @@ from typing import Optional
 
 
 def get_configs():
-    iter_params = dict(block_M=[128], block_N=[128], num_stages=[0, 1, 2], threads=[128, 256])
+    sm_major, _ = torch.cuda.get_device_capability()
+    if sm_major >= 9:
+        iter_params = dict(block_M=[128], block_N=[128], num_stages=[0, 1, 2], threads=[128, 256])
+    else:
+        iter_params = dict(block_M=[64], block_N=[64], num_stages=[1], threads=[128])
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
+
+
+def get_runtime_config():
+    sm_major, _ = torch.cuda.get_device_capability()
+    if sm_major >= 9:
+        return 128, 128, 2, 256
+    return 64, 64, 1, 128
 
 
 @autotune(configs=get_configs(), warmup=500, rep=100)
@@ -83,11 +94,13 @@ def flashattn(
 
             start = T.max(0, (bx * block_M + past_len - window_size) // block_N) if window_size is not None else 0
 
-            for k in T.Pipelined(start, end, num_stages=num_stages):
-                T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
+            loop_range = end - start
+            for k in T.Pipelined(loop_range, num_stages=num_stages):
+                actual_k = k + start
+                T.copy(K[bz, by, actual_k * block_N : (actual_k + 1) * block_N, :], K_shared)
                 for i, j in T.Parallel(block_M, block_N):
                     q_idx = bx * block_M + i + past_len
-                    k_idx = k * block_N + j
+                    k_idx = actual_k * block_N + j
                     if window_size is not None:
                         acc_s[i, j] = T.if_then_else(q_idx >= k_idx and q_idx < k_idx + window_size, 0, -T.infinity(acc_s.dtype))
                     else:
@@ -119,7 +132,7 @@ def flashattn(
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] *= scores_scale[i]
 
-                T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
+                T.copy(V[bz, by, actual_k * block_N : (actual_k + 1) * block_N, :], V_shared)
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i in T.Parallel(block_M):
@@ -215,10 +228,7 @@ def main(
         print(f"Best TFlops: {total_flops / kernel.latency * 1e-9}")
         print(f"Best config: {kernel.config}")
     else:
-        block_M = 128
-        block_N = 128
-        num_stages = 2
-        threads = 256
+        block_M, block_N, num_stages, threads = get_runtime_config()
         print(f"{block_M=}, {block_N=}, {num_stages=}, {threads=}")
 
         kernel = flashattn(
@@ -260,10 +270,7 @@ def run_regression_perf(
     dtype: str = "float16",
 ):
     torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[dtype]
-    block_M = 128
-    block_N = 128
-    num_stages = 2
-    threads = 256
+    block_M, block_N, num_stages, threads = get_runtime_config()
     kernel = flashattn(
         batch, heads, seq_q, seq_kv, dim, window_size, block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads, dtype=dtype
     )

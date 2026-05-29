@@ -3,10 +3,10 @@ import tilelang
 import tilelang.language as T
 from tilelang.profiler import do_bench
 import argparse
-from fla.ops.linear_attn import fused_chunk_linear_attn  # We compare with FLA
-from fla.modules.l2norm import l2norm_fwd
 from einops import rearrange
 from typing import Optional, Tuple
+from fla.ops.linear_attn import fused_chunk_linear_attn
+from fla.modules.l2norm import l2norm_fwd
 
 
 @tilelang.jit(

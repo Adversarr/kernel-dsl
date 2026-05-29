@@ -2,6 +2,7 @@ import torch
 import tilelang
 import tilelang.language as T
 from tilelang.utils import determine_fp8_type
+from fp8_runtime import has_fp8_runtime_support
 
 
 @tilelang.jit
@@ -72,6 +73,9 @@ def test_gemm_fp8(M, N, K, dtype):
 
 
 def main():
+    if not has_fp8_runtime_support():
+        print("Skipping FP8 GEMM 2xAcc example: native FP8 MMA requires SM89+ hardware.")
+        return
     test_gemm_fp8(1024, 1024, 8192, determine_fp8_type())
     test_gemm_fp8(1024, 1024, 8192, determine_fp8_type("e5m2"))
 

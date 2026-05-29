@@ -3,6 +3,7 @@ from typing import Literal, Callable
 from tvm import DataType
 from tvm.tirx import IndexMap
 from tilelang.cuda.intrinsics.layout.utils import get_mma_micro_size
+from tilelang.tools import plot_layout
 
 
 def make_mma_load_base_layout(dtype: T.dtype = T.float16, matrix: Literal["A", "B"] = "A", transposed: bool = False) -> T.Fragment:
@@ -103,8 +104,6 @@ block_cols = 2
 warp_rows = 4
 warp_cols = 4
 chunk = 2
-
-from tilelang.tools import plot_layout
 
 # ldmatrix layout 16x16
 base_layout = make_mma_load_base_layout(dtype=T.float16, matrix="A", transposed=False)

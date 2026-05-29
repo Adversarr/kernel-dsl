@@ -5,7 +5,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.profiler import do_bench
-from varlen_utils import generate_random_padding_mask, generate_qkv
+from varlen_utils import generate_random_padding_mask, generate_qkv, padded_varlen_attention_reference
 
 
 @tilelang.jit(
@@ -176,21 +176,25 @@ def main(
     out_unpad = kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q)
     out = output_pad_fn(out_unpad)
 
-    import flash_attn
-
-    fa_out_unpad = flash_attn.flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        0.0,
-        causal=is_causal,
-    )
-    fa_out = output_pad_fn(fa_out_unpad)
-    torch.testing.assert_close(out, fa_out, rtol=1e-2, atol=1e-2)
+    try:
+        import flash_attn
+    except ModuleNotFoundError:
+        ref_out = padded_varlen_attention_reference(q, k, v, query_padding_mask, key_padding_mask, causal=is_causal, groups=groups)
+        print("flash_attn reference skipped: using the local padded reference implementation.")
+    else:
+        ref_out_unpad = flash_attn.flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            0.0,
+            causal=is_causal,
+        )
+        ref_out = output_pad_fn(ref_out_unpad)
+    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
     print("All checks passed.✅")
     latency = do_bench(lambda: kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q), _n_warmup=5, _n_repeat=5)

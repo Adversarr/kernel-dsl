@@ -35,6 +35,8 @@ def get_heuristic_config() -> Tuple[Dict, int]:
     print(f"CUDA device capability: {sm_version}")
     if sm_version == 89:
         cfg = dict(block_N=128, block_H=64, num_split=1, num_stages=0, threads=128)
+    elif sm_version >= 80 and sm_version < 89:
+        cfg = dict(block_N=64, block_H=64, num_split=1, num_stages=1, threads=128)
     else:
         cfg = dict(block_N=128, block_H=64, num_split=8, num_stages=2, threads=128)
     return cfg, sm_version

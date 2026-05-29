@@ -11,10 +11,12 @@ from typing import Optional
 def get_bwd_configs():
     sm_major, sm_minor = torch.cuda.get_device_capability()
     sm_version = sm_major * 10 + sm_minor
-    if sm_version == 80:
+    if sm_version >= 80 and sm_version < 90:
         return 64, 32, 1, 128
-    else:
+    elif sm_version >= 90:
         return 128, 32, 2, 256
+    else:
+        raise ValueError(f"Unsupported SM version: {sm_version}")
 
 
 @tilelang.jit(
@@ -82,18 +84,20 @@ def flashattn_fwd(
             end = T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
             start = T.max(0, (bx * block_M - window_size) // block_N) if window_size is not None else 0
 
-            for k in T.Pipelined(start, end, num_stages=num_stages):
-                T.copy(K[bz, by // groups, k * block_N : (k + 1) * block_N, :], K_shared)
+            loop_range = end - start
+            for k in T.Pipelined(loop_range, num_stages=num_stages):
+                actual_k = k + start
+                T.copy(K[bz, by // groups, actual_k * block_N : (actual_k + 1) * block_N, :], K_shared)
                 for i, j in T.Parallel(block_M, block_N):
                     q_idx = bx * block_M + i
-                    k_idx = k * block_N + j
+                    k_idx = actual_k * block_N + j
                     if window_size is not None:
                         acc_s[i, j] = T.if_then_else(q_idx >= k_idx and q_idx < k_idx + window_size, 0, -T.infinity(acc_s.dtype))
                     else:
                         acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                T.copy(V[bz, by // groups, k * block_N : (k + 1) * block_N, :], V_shared)
+                T.copy(V[bz, by // groups, actual_k * block_N : (actual_k + 1) * block_N, :], V_shared)
                 T.copy(scores_max, scores_max_prev)
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 for i in T.Parallel(block_M):

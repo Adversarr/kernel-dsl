@@ -1,6 +1,13 @@
 # Kernel DSL
 
-Kernel DSL is a bunch of skills to write/improve deep learning operators in DSLs, such as tilelang, triton, and cutedsl.
+Kernel DSL is a collection of skills to write and improve deep learning operators in DSLs such as TileLang, Triton, and CuTeDSL.
+It is distilled from many existing repos, see [Acknowledgements](#acknowledgements).
+
+Usage: copy `skills/*` into your agents' `skills` folder. (e.g. `<your_repo>/.claude/skills/`, `<your_repo>/.agents/skills/`)
+
+## Develop
+
+We use `trial/<some_dsl>` to validate our skill can actually work as expected, and improve the skill documents if possible.
 
 ## TODO
 
@@ -14,6 +21,9 @@ Harness
 - [x] Profiler (ncu)
 
 Documents
+- [x] KernelWiki from mit-han-lab.
+
+Misc
 - [ ] Shorten the skill documents.
 
 # Acknowledgements

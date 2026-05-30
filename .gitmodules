@@ -4,3 +4,6 @@
 [submodule "3rdparty/ncu-report-skill"]
 	path = 3rdparty/ncu-report-skill
 	url = https://github.com/mit-han-lab/ncu-report-skill.git
+[submodule "3rdparty/KernelWiki"]
+	path = 3rdparty/KernelWiki
+	url = https://github.com/mit-han-lab/KernelWiki.git

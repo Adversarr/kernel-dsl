@@ -54,7 +54,7 @@ primitives; the examples show the intended tile-level decomposition.
 
 - **dequantize_gemm/**: A family of dequantization GEMM kernels that unpack low-bit storage formats (FP4, MXFP4, INT4, W4A8) into higher-precision compute formats on-the-fly, targeting both Hopper (NVIDIA) and CDNA4 (AMD) architectures.
 
-- **grouped_gemm/**: Grouped GEMM where a single matrix A is multiplied by multiple independent weight matrices B with variable-length group sizes, supporting both forward and backward passes with `torch.autograd.Function` integration.
+- **grouped_gemm/**: Grouped GEMM examples covering two different contracts: a segmented-row formulation where one packed matrix A is multiplied by per-group weights with variable-length row groups, and a ptr-table formulation where each group keeps its own tensor storage. Read the grouped-GEMM file headers carefully before tuning: the padding, metadata, and pipeline constraints differ between the two variants.
 
 - **convolution/**: A 2D convolution using the im2col + GEMM strategy with `T.im2col` for spatial unrolling and `T.Pipelined` for overlapping data movement with GEMM computation. Includes autotuned variants with architecture-specific heuristics.
 

@@ -4,6 +4,18 @@ import tilelang
 import tilelang.language as T
 import math
 
+# Operator contract:
+# - This example is a segmented-row grouped GEMM, not a fully independent
+#   per-group (M_g, N_g, K_g) GEMM list.
+# - `A` is one packed 2D tensor whose rows are partitioned into variable-length
+#   groups by `batch_sizes` and `batch_offsets`.
+# - `B` stores one weight matrix per group, while `K` and `N` are shared across
+#   groups.
+# - `batch_padded_offsets` maps launch tiles over padded row groups, which is
+#   why the logical row offset and tile offset are tracked separately.
+# - If you autotune or benchmark this kernel, pass a real consistent set of
+#   metadata tensors rather than relying on auto-generated inputs.
+
 
 def torch_gmm(a, b, batch_sizes, batch_offsets_tensor, trans_b=False):
     """
@@ -114,6 +126,8 @@ def construct_inputs(batch_sizes_list, K, M, trans_b, padding_M, device, dtype):
     for i in range(batch_count - 1):
         batch_offsets_list.append(batch_offsets_list[-1] + batch_sizes_list[i])
     for i in range(batch_count - 1):
+        # Launch tiles are assigned over padded group rows, so we need a padded
+        # offset table in addition to the logical row offset table.
         batch_padded_offsets_list.append(batch_padded_offsets_list[-1] + math.ceil((batch_sizes_list[i]) / padding_M) * padding_M)
     A = torch.randn(batch_sum, K, device=device, dtype=dtype)
     if trans_b:

@@ -13,6 +13,7 @@ Treat the bundled local files as the source of truth:
 
 - `references/README.md`: main TileLang reference entry point
 - `examples/README.md`: example catalogue and operator inventory
+- `FAQs.md`: common failure modes, debugging shortcuts, and issue-driven fixes
 
 Do not rely on external TileLang docs unless the user explicitly asks for
 outside information.
@@ -43,6 +44,10 @@ Start with:
 Open `references/programming_guides/language_basics.md` early when the user
 needs more detail on symbolic shapes, dtype forms, launch structure, or the
 `T.copy(...)` versus `T.async_copy(...)` distinction.
+
+Open `FAQs.md` early when the user reports a concrete compiler error, profiler
+surprise, autotuning failure, or an example that compiles but does not validate
+or perform as expected.
 
 Then open deeper files only as needed.
 
@@ -87,8 +92,10 @@ Route by user intent, not by file tree.
 2. Open `references/README.md` first for the compact overview, quick API table, and template shape.
 3. Open `references/programming_guides/language_basics.md` next for detailed DSL semantics or symbolic-shape questions.
 4. Open `examples/README.md` when the user needs a matching runnable example.
-5. Use deeper pages under `references/` only for exact semantics, caveats, or internals.
-6. Prefer the simplest correct example before advanced architecture-specific variants.
+5. Open `FAQs.md` when the task sounds like a known failure mode or a practical
+   "why did this happen?" question.
+6. Use deeper pages under `references/` only for exact semantics, caveats, or internals.
+7. Prefer the simplest correct example before advanced architecture-specific variants.
 
 ## Answering Rules
 
@@ -106,3 +113,5 @@ Route by user intent, not by file tree.
 - Some deeper reference pages are more detailed than the top-level overview; follow `references/README.md` links when the top-level summary is not enough.
 - Some useful pages are not part of the original top-level toctree, especially `references/programming_guides/cluster_tma.md` and `references/runtime_internals/stubs.md`; still use them when relevant.
 - The local example tree is broad and evolves faster than prose docs, so prefer `examples/README.md` to choose an operator family and then open the specific example directory or README.
+- `FAQs.md` is intentionally issue-driven and may mention pitfalls not yet
+  surfaced in the higher-level guides; use it for surgical debugging advice.

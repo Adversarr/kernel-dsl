@@ -8,7 +8,8 @@ inside the bundled reference pages.
 TileLang is a Python-first DSL for writing high-performance kernels for targets
 such as CUDA and HIP. The local material in this directory is the source of
 truth for semantics and guidance in this skill. Use `../examples/README.md` for
-the example catalogue and operator inventory.
+the example catalogue and operator inventory. Use `../FAQs.md` for known
+failure modes and issue-driven debugging shortcuts.
 
 ## Start Here
 
@@ -40,6 +41,7 @@ Use the rest of the local docs by intent:
   - `tutorials/auto_tuning.md`
   - `tutorials/debug_tools_for_tilelang.md`
   - `tutorials/logging.md`
+  - `../FAQs.md`
   Prefer the Decorator Workflow for autotuning by default; use the Programmatic Workflow only when explicitly requested or when finer control is required.
 - operator walkthroughs:
   - `deeplearning_operators/elementwise.md`

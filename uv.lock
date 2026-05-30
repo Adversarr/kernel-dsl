@@ -294,6 +294,7 @@ dependencies = [
     { name = "packaging" },
     { name = "tilelang" },
     { name = "torch" },
+    { name = "triton" },
 ]
 
 [package.metadata]
@@ -304,6 +305,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=26.2" },
     { name = "tilelang", specifier = ">=0.1.10" },
     { name = "torch", specifier = ">=2.12.0" },
+    { name = "triton", specifier = ">=3.7.0" },
 ]
 
 [[package]]

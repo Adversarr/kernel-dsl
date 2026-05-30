@@ -102,3 +102,52 @@ configuration to support TMA.
 Rule of thumb: if profilers show more threads than expected, check whether the
 kernel or pass configuration allowed TMA. When TMA is active, TileLang may add
 producer warps on top of your requested worker threads.
+
+## [Question] Autotune fails for every config on a metadata-driven kernel
+
+If autotuning logs repeated validation failures or even reports that no
+configuration succeeded, and your kernel takes structured metadata tensors such
+as offsets, lengths, masks, or grouped-GEMM size tables, the usual cause is
+that autotune is benchmarking the kernel with auto-generated inputs that do not
+respect the metadata contract.
+
+For example, a grouped kernel may expect inputs like:
+
+```python
+packed_lhs: T.Tensor((group_size, padded_M, padded_K), dtype)
+packed_rhs: T.Tensor((group_size, padded_K, padded_N), dtype)
+group_sizes: T.Tensor((group_size, 3), "int32")
+```
+
+where `group_sizes[g] = (M_g, N_g, K_g)` drives which output rows and columns
+are valid for each group. If autotune generates arbitrary tensors for the data
+inputs and metadata input independently, the reference program and the kernel
+can disagree on what the valid region is, so every candidate config appears
+wrong even when the kernel is fine.
+
+The fix is to capture real, mutually consistent inputs with
+`set_autotune_inputs(...)`:
+
+```python
+from tilelang.autotuner import AutoTuner, set_autotune_inputs
+
+with set_autotune_inputs(packed_lhs, packed_rhs, group_sizes):
+    result = (
+        AutoTuner.from_kernel(kernel=kernel, configs=configs)
+        .set_compile_args(out_idx=[-1], target="auto")
+        .set_profile_args(ref_prog=packed_reference, skip_check=False)
+        .run(warmup=3, rep=20)
+    )
+```
+
+Two extra checks help a lot:
+
+1. Ensure the reference program accepts the same input signature as the kernel's
+   non-output inputs.
+2. If you compare full packed outputs, define the padded or invalid region
+   explicitly, for example by zero-filling skipped tiles, rather than leaving
+   that region unspecified.
+
+Rule of thumb: whenever kernel correctness depends on metadata tensors rather
+than just shapes and dtypes, autotune with real captured inputs instead of
+relying on automatic input generation.

@@ -7,6 +7,18 @@ import torch
 import tilelang as tl
 import tilelang.language as T
 
+# Operator contract and limitations:
+# - This example keeps per-group tensors separate and passes them through ptr
+#   tables; it is a different contract from the segmented-row grouped GEMM
+#   example in `example_grouped_gemm_fwd.py`.
+# - The current ptr path uses a common `max_M` backing shape per group rather
+#   than truly runtime-varying tensor shapes.
+# - Multi-stage software pipelining is not correct yet on this ptr-backed path,
+#   so the example intentionally keeps a single-stage copy/compute loop.
+# - If you autotune or benchmark a ptr-backed grouped kernel, validate with real
+#   captured inputs and treat metadata and pointer tables as part of the
+#   operator contract, not as interchangeable random tensors.
+
 
 def make_ptr_table(tensors):
     assert tensors, "pointer table requires at least one tensor"

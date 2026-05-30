@@ -123,6 +123,24 @@ with set_autotune_inputs([a, b]):
     ...
 ```
 
+This is especially important for metadata-driven kernels, not just symbolic
+shapes. If correctness depends on offsets, masks, lengths, grouped-GEMM size
+tables, or similar structured tensors, capture a real consistent input set so
+autotune validates each config against the actual contract:
+
+```python
+group_sizes = torch.tensor(..., device="cuda", dtype=torch.int32)
+
+with set_autotune_inputs(packed_lhs, packed_rhs, group_sizes):
+    result = autotuner.run(warmup=3, rep=20)
+```
+
+If the kernel takes metadata tensors, make sure the reference program accepts
+the same non-output input signature as the kernel. A mismatched reference
+signature or auto-generated metadata tensor is a common reason every config
+appears to fail validation even when the kernel implementation is otherwise
+correct.
+
 ### Decorator Arguments
 
 ```python

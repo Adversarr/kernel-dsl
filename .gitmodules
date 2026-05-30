@@ -1,3 +1,6 @@
 [submodule "3rdparty/tilelang"]
 	path = 3rdparty/tilelang
 	url = https://github.com/tile-ai/tilelang.git
+[submodule "3rdparty/ncu-report-skill"]
+	path = 3rdparty/ncu-report-skill
+	url = https://github.com/mit-han-lab/ncu-report-skill.git

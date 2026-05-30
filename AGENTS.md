@@ -1,6 +1,7 @@
 # AGENTS.md
 
 This repository is a skill-building workspace, not a typical application/library repo.
+`uv` and a`.venv` are setup to manage dependencies to test the kernels.
 
 ## Repository Layout
 

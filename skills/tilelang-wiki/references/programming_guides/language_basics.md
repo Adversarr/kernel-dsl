@@ -159,6 +159,10 @@ Common scopes:
 - `T.alloc_local(...)` allocates thread-local local storage.
 - `T.alloc_var(...)` allocates a single scalar-like local buffer.
 
+The shape of a fragment or shared buffer often reflects the intended
+computation structure and should usually be chosen from the operator's
+canonical tiled formulation, not invented ad hoc from scalar reasoning.
+
 Use `T.clear(buffer)` or `T.fill(buffer, value)` to initialize accumulators and
 temporary buffers.
 
@@ -216,6 +220,13 @@ for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
 `T.Parallel` creates a parallel loop nest and is the default for elementwise
 tile work. `T.Pipelined` is the common loop form around repeated copy/compute
 stages, especially GEMM and attention.
+
+These loop forms describe work over tiles, not a recommendation to design
+kernels one scalar at a time.
+
+In practice, first choose the tile-shaped buffers and loop-carried state that
+match the operator. Then use `T.Parallel`, `T.reduce_*`, `T.copy`, and
+`T.Pipelined` to express the work over those tiles.
 
 In eager JIT code, ordinary Python `range(...)` is also supported and maps to a
 serial TileLang loop. Use `T.grid(...)` when you want a compact Cartesian

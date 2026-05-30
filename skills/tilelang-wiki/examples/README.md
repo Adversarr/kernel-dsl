@@ -6,6 +6,10 @@ A collection of TileLang kernel examples demonstrating the DSL's capabilities ac
 
 ## Getting Started
 
+When an operator family has a dedicated example here, prefer it over deriving
+the operator from a generic reference template. The reference docs explain
+primitives; the examples show the intended tile-level decomposition.
+
 - **quickstart.py**: The entry-point example — a tiled matrix multiplication kernel with a fused ReLU activation. Demonstrates `@tilelang.jit`, shared memory tiling, fragment allocation, pipelined `T.copy`, `T.gemm` for tensor core dispatch, and `T.Parallel` for elementwise ops, with profiling and correctness validation against PyTorch.
 
 - **gemm/**: The canonical introduction to TileLang. Starts with a basic tiled GEMM demonstrating all core DSL primitives, then progresses through layout annotations, swizzle-based rasterization, autotuning, fine-grained MMA intrinsics (`ldmatrix`, `mma`, `stmatrix`), and persistent kernels. Includes a detailed README tutorial.
@@ -24,7 +28,7 @@ A collection of TileLang kernel examples demonstrating the DSL's capabilities ac
 
 - **norm/**: Full LayerNorm (forward and backward) and RMSNorm (split-K and non-split variants) kernels. Demonstrates reduction primitives (`T.reduce_sum`, `T.reduce_max`), shared memory tiling, and `torch.autograd.Function` integration for end-to-end training.
 
-- **online_softmax/**: A numerically stable online softmax kernel using the two-pass maximum-and-log-sum-exp algorithm with base-2 `exp2`/`log2`. Demonstrates `T.Pipelined` tiled iteration, `T.reduce_max`, `T.reduce_sum`, and mixed-precision (float16 input, float32 accumulation) within a single kernel.
+- **online_softmax/**: A numerically stable online softmax kernel using the two-pass maximum-and-log-sum-exp algorithm with base-2 `exp2`/`log2`. This is a canonical starting point for learning how TileLang expresses row-wise operators with loop-carried state. Demonstrates `T.Pipelined` tiled iteration, `T.reduce_max`, `T.reduce_sum`, and mixed-precision (float16 input, float32 accumulation) within a single kernel.
 
 - **topk/**: A top-K selection kernel using iterative `T.reduce_max` over rows, recording maxima then zeroing them out for the next iteration. Supports autotuning over block size and thread count.
 

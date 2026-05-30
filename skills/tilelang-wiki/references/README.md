@@ -40,6 +40,7 @@ Use the rest of the local docs by intent:
   - `tutorials/auto_tuning.md`
   - `tutorials/debug_tools_for_tilelang.md`
   - `tutorials/logging.md`
+  Prefer the Decorator Workflow for autotuning by default; use the Programmatic Workflow only when explicitly requested or when finer control is required.
 - operator walkthroughs:
   - `deeplearning_operators/elementwise.md`
   - `deeplearning_operators/gemv.md`
@@ -301,6 +302,24 @@ The most common host-side and kernel-side tools are:
 | `profiler.assert_allclose(...)` | Compare against a reference |
 | `profiler.assert_consistent(...)` | Re-run to catch output instability or races |
 
+## Mental Model
+
+TileLang is primarily tile-level programming, not elementwise programming with a
+GPU-flavored syntax.
+
+When writing a kernel, first decide:
+
+- what tile-shaped data is staged at each step
+- what tile-shaped state must persist across loop iterations
+- what operator family already has a canonical example
+
+Treat the shapes of shared and fragment buffers as part of the algorithm design,
+not as incidental storage details.
+
+A kernel can be shape-legal and still be the wrong starting structure if it
+scalarizes state that is naturally tile-shaped, or if it is derived from a
+generic template instead of the canonical operator example.
+
 ## Kernel Templates
 
 The local examples are the actual runnable templates. Use this section to choose
@@ -332,6 +351,9 @@ Start from:
 Use this pattern when each output row accumulates across a tiled reduction
 dimension:
 
+This template teaches tiled reduction mechanics. It is not a default derivation
+path for every row-wise operator.
+
 ```python
 acc = T.alloc_fragment((block_M,), accum_dtype)
 T.clear(acc)
@@ -342,6 +364,11 @@ for ko in T.serial(T.ceildiv(N, block_N)):
         acc[i] = acc[i] + local_sum[i]
 T.copy(acc, Out[bx * block_M])
 ```
+
+If an operator family has an example under `examples/`, prefer that operator
+example over rewriting the operator from generic reduction primitives. In
+TileLang, the buffer shapes and loop-carried state are part of the kernel
+design.
 
 Start from:
 

@@ -1,0 +1,378 @@
+\section{Background and Related Works}
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Programming Models for LLM Systems}
+\label{sec:background-programming-model}
+
+Modern LLM systems are programmed at multiple abstraction levels. Frameworks such as PyTorch and JAX express models as tensor-operator graphs and integrate naturally with automatic differentiation, but operator boundaries often become materialization ones.
+
+Compiler systems lower tensor programs to optimized kernels through graph rewriting, scheduling, code generation, and autotuning~\cite{ansel2024pytorch,chen2018tvm,tillet2019triton}. Algebraic reformulation is another important source of performance, as shown by TASO~\cite{jia2019taso} and Mirage~\cite{wu2025mirage}. However, rapidly evolving accelerators make peak performance a moving target for general-purpose compilers.
+
+Closer to the hardware level, programmers use kernel DSLs and libraries such as Triton~\cite{tillet2019triton}, ThunderKittens~\cite{spector2024thunderkittens,spector2025look,sul2025parallelkittens}, TileLang~\cite{wang2025tilelang}, CuTeDSL~\cite{Thakkar_CUTLASS_2023}, Gluon, and TLX, or rely on specialized LLM kernels in vLLM~\cite{kwon2023efficient}, SGLang~\cite{zheng2024sglang}, FlashInfer~\cite{ye2025flashinfer}, and Liger Kernels~\cite{hsu2024liger}. These approaches deliver high performance, but extending them to new transformations or backward computations still requires substantial low-level engineering.
+
+\subsection{GEMM Mainloops and Epilogue Fusion}
+\label{sec:background-gemm-epilogue}
+
+Matrix multiplication is the central compute primitive in modern LLM workloads. A high-performance GEMM kernel is typically divided into a mainloop and an epilogue. The mainloop performs the tiled matrix multiply-accumulate computation, while the epilogue transforms the computed output tile and efficiently writes it back to global memory.
+
+\begin{wrapfigure}{r}{0.39\textwidth}
+    \centering
+    \vspace{-25pt}
+    \includegraphics[width=\linewidth]{figs/epilogue.pdf}
+    \vspace{-12pt}
+    \caption{A GEMM mainloop computes output tiles; the epilogue transforms each tile before the final global-memory store.}
+    \label{fig:mainloop-epilogue}
+    \vspace{-12pt}
+\end{wrapfigure}
+
+The epilogue is a natural place to implement fusions because the output of the matmul is already present on chip close to compute cores. Practical epilogues commonly perform scaling, bias addition, activations, residual updates, data type conversions, tile-wise reductions and other output elementwise operations, avoiding separate kernel launches and extra global-memory round trips. Modern kernel libraries formalize this separation directly: CUTLASS~\cite{Thakkar_CUTLASS_2023} represents GEMM kernels as a composition of a collective mainloop and a collective epilogue, while Epilogue Visitor Trees further express epilogues as compositions of primitives~\cite{chen2024evt}.
+
+This flexibility operates under a locality constraint. An epilogue sees only the local output tile, its accumulators, and consistently indexed auxiliary tensors, meaning that operations requiring global reductions or cross-tile communication must be reformulated into tile-local pieces or handled in a separate pass. CODA builds on this interface, keeping the high-performance GEMM mainloop fixed and using the epilogue as a programmable site for nearby memory-bound computation.
+
+
+\section{CODA}
+\label{sec:coda}
+
+The previous section argued that GEMM epilogues are a natural place to fuse memory-bound computation into dense linear algebra. We now describe \texttt{CODA}, a GPU kernel abstraction that realizes this idea. \Cref{sec:epilogue-primitives} identifies a small set of epilogue primitives that map efficiently to GPU execution. \Cref{sec:reparameterization} shows how the non-attention and non-embedding portions of the Transformer forward and backward pass can be reparameterized using these primitives. Finally, \Cref{sec:implementations} describes their implementation and our LLM-oriented authoring workflow.
+
+\subsection{Efficient Epilogue Primitives}
+\label{sec:epilogue-primitives}
+
+\texttt{CODA} programs the GEMM epilogue while keeping the mainloop fixed and highly optimized. For each output tile, an epilogue may load auxiliary data, transform accumulator values, emit auxiliary results, and store the final output. This interface is deliberately restricted to tile-local computation rather than arbitrary global communication. Our epilogue template, shown in \Cref{label:evt-template}, is inspired by Epilogue Visitor Trees~\cite{chen2024evt}.
+\texttt{CODA} provides five classes of epilogue primitives:
+\begin{enumerate}[leftmargin=*,nosep,nolistsep,noitemsep]
+    \item \emph{Elementwise and pairwise maps:} apply local transformations to accumulator values, including residual updates, activations, RoPE-style rotations, and SwiGLU-style gates.
+    \item \emph{Vector (Rank-1 Tensor) loads and stores:} load row or column vectors, broadcast them over an output tile, and optionally write vector-valued auxiliary results.
+    \item \emph{Tile (Rank-2 Tensor) loads and stores:} load or store matrix tiles, such as residual streams, saved activations, or intermediate values needed by the backward pass.
+    \item \emph{Tile (Rank-2 Tensor) reductions:} compute partial reductions over rows or columns of an output tile, to be combined later by a lightweight auxiliary kernel.
+    \item \emph{Stateful transforms:} maintain running tile state, such as the max and sum-exp statistics used in online log-sum-exp and cross-entropy.
+\end{enumerate}
+
+
+
+These primitives are intentionally narrow, operating at a level low enough to compile to efficient epilogue code and expressive enough to capture the memory-bound operations surrounding GEMMs in our Transformer reparameterizations, as shown next.
+
+
+
+\subsection{Reparameterizing Transformers as Epilogues}
+\label{sec:reparameterization}
+
+We now show that the primitive set above is sufficient for much of Transformer computation. After lightweight algebraic reparameterization, many non-attention and non-embedding components of a standard Transformer forward pass can be written as
+\begin{align*}
+    \text{GEMM:}\quad
+    \vh = \vx \mW,
+    \qquad
+    \text{Epilogue:}\quad
+    \vy[i,j] = \vf[i,j]\!\left(\vh[i,j]\right),
+\end{align*}
+where $[i,j]$ indexes an output tile and $\vf[i,j]$ is the tile function implemented in the GEMM epilogue. The epilogue is either fully tile-local, or tile-local up to partial results that are combined by a lightweight auxiliary reduction. We first apply this view to the forward pass, then show that independent tile functions preserve the same GEMM-epilogue structure in the backward pass.
+
+\subsubsection{GEMM-Residual-RMSNorm-GEMM Pattern}
+\label{sec:gemm-residual-rmsnorm-gemm}
+
+A recurring pattern in pre-normalized Transformers is a GEMM followed by a residual update and normalization, then another GEMM. This pattern appears across several adjacent sublayers:
+\begin{enumerate}[leftmargin=*,nosep,nolistsep,noitemsep]
+    \item attention output projection $\rightarrow$ residual stream $\rightarrow$ RMSNorm $\rightarrow$ MLP gate/up projection;
+    \item MLP down projection $\rightarrow$ residual stream $\rightarrow$ RMSNorm $\rightarrow$ attention QKV projection;
+    \item final MLP down projection $\rightarrow$ residual stream $\rightarrow$ final RMSNorm $\rightarrow$ language modeling head.
+\end{enumerate}
+Although these cases are usually written as parts of different modules, they share the same computational structure:
+\begin{align*}
+\vy
+= \operatorname{RMSNorm}(\vx \mW_0 + \vz, \boldsymbol{\gamma}) \mW_1
+= \Bigl(r \, \bigl(\vx \mW_0 + \vz\bigr) \odot \boldsymbol{\gamma}\Bigr) \mW_1,
+\label{eq:gemm-res-rms-gemm}
+\end{align*}
+where $\vz$ denotes the residual stream and
+$r = 1 / \operatorname{rms}(\vx \mW_0 + \vz)$ is the row-wise inverse RMS factor. This pattern crosses the usual module boundary: it couples the output projection of one sublayer with the input projection of the next.
+
+Residual addition and multiplication by the RMSNorm weight $\boldsymbol{\gamma}$ are tile-local, so they can be fused into a GEMM epilogue. The row-wise factor $r$, however, requires a reduction across the hidden dimension, which is larger than a single output tile. In the canonical computation, $r$ is applied before the second GEMM, creating an apparent dependency between normalization and the next projection.
+
+\begin{wrapfigure}{r}{0.6\textwidth}
+  \centering
+  \vspace{-17pt}
+  \includegraphics[width=0.99\linewidth]{figs/kernel-0-v2.pdf}
+  \vspace{-1pt}
+  \caption{GEMM-RMSNorm-GEMM reparameterization.}
+  \label{fig:gemm-res-rms-gemm-kernels}
+  \vspace{-11pt}
+\end{wrapfigure}
+
+We address the reduction by splitting it into two levels. The first GEMM epilogue computes tile-local partial reductions, and a small auxiliary kernel reduces these partials across tiles to obtain $r$. Since the auxiliary kernel reads a few partial values per tile rather than the full activation tensor, its memory traffic is much smaller than that of a standalone RMSNorm.
+
+The apparent dependency on $r$ can be removed algebraically. Since $r$ is shared across the row, it commutes with the second GEMM:
+\begin{align*}
+\vy
+= \Bigl(r \, \bigl(\vx \mW_0 + \vz\bigr) \odot \boldsymbol{\gamma}\Bigr) \mW_1
+= r \, \Bigl(\bigl(\vx \mW_0 + \vz\bigr) \odot \boldsymbol{\gamma}\Bigr) \mW_1 .
+\end{align*}
+Thus, the row-wise scale does not need to be applied before the second GEMM. It can instead be delayed to the epilogue of the second GEMM, after the projection has been computed.
+
+Concretely, the computation decomposes into two GEMMs and one lightweight reduction (\cref{fig:gemm-res-rms-gemm-kernels}):
+\begin{align*}
+&\text{GEMM 1:}& \vh_0 &= \vx \mW_0, \quad
+&\text{Epilogue 1:}& \quad
+&\vh_1[i,j] &= \vh_0[i,j] + \vz[i,j], \\
+&&&&&&\vh_2[i,j] &= \vh_1[i,j] \odot \boldsymbol{\gamma}[j], \\
+&&&&&&\widehat{\vr}[i,j] &= \operatorname{partialRMS}(\vh_1[i,j]),\\[7pt]
+&\text{GEMM 2:} &\vh_3 &= \vh_2 \mW_1, \qquad
+&\text{Epilogue 2:}& \quad
+&\vy[i,j] &= r[i] \, \vh_3[i,j].
+\end{align*}
+\begin{wrapfigure}{r}{0.30\textwidth}
+  \centering
+  \vspace{-17pt}
+  \includegraphics[width=0.99\linewidth]{figs/20260517-fig-0.pdf}
+  \vspace{-15pt}
+  \caption{Benchmarks.}
+  \label{fig:gemm-res-rms-gemm-results}
+  \vspace{-27pt}
+\end{wrapfigure}
+Here $r = 1 / \sqrt{\operatorname{reduce}(\widehat{\vr}) + \epsilon}$ is computed by a small auxiliary reduction over the tile partials. This decomposition replaces a standalone RMSNorm kernel with tile-local epilogue work around the two GEMMs, plus a lightweight auxiliary reduction.
+
+In \Cref{fig:gemm-res-rms-gemm-results}, we benchmark this reparameterization against existing implementations on LLaMA-style configurations with a batch of 16K tokens. We vary the hidden dimension across representative model scales, with $d \in \{2048, 4096, 8192\}$ corresponding roughly to 1B, 7B, and 70B models, respectively. Our GEMM-Epilogue kernel is generated by an LLM provided with the above abstractions (explained in more detail in \cref{sec:llm-kernel-authoring}).
+
+\begin{wrapfigure}{r}{0.27\textwidth}
+    \centering
+    \vspace{-20pt}
+    \includegraphics[width=\linewidth]{figs/gemm_rms_gemm_numerics.pdf}
+    \vspace{-22pt}
+    \caption{Relative error.}
+    \label{fig:gemm-rms-gemm-numerics}
+    \vspace{-10pt}
+\end{wrapfigure}
+\paragraph{Numerics.}
+The reparameterization changes where the RMSNorm scale is applied: the row-wise factor $r$ is delayed from before the second GEMM to the second GEMM epilogue. We compare \texttt{BF16} GEMM-RMSNorm-GEMM outputs against an \texttt{FP32} reference on Llama-3 8B layers. We report the errors of \texttt{CODA} and QuACK, on which our GEMM template is based, normalized by the error of the standard PyTorch path. \Cref{fig:gemm-rms-gemm-numerics} suggests that a more accurate GEMM mainloop can reduce numerical error, and that \texttt{CODA}'s reparameterized epilogue can reduce it further.
+
+\subsubsection{GEMM with Pairwise Activations}
+\label{sec:gemm-pairwise-activation}
+
+A second common pattern in Transformers is a GEMM followed by a \emph{pairwise} activation. Unlike an elementwise activation, which transforms each feature independently, a pairwise activation consumes two adjacent feature values and produces one or two outputs. 
+\begin{align*}
+\vh = \vx \mW,
+\qquad
+\vh_a[i,j], \vh_b[i,j] = \operatorname{split}\left(\vh[i,j]\right),
+\qquad
+\vy[i,j] = \vf[i,j]\left(\vh_a[i,j], \vh_b[i,j]\right).
+\end{align*}
+\begin{wrapfigure}{r}{0.375\textwidth}
+  \centering
+  \vspace{-15pt}
+  \includegraphics[width=\linewidth]{figs/kernel-1.pdf}
+  \vspace{-12pt}
+  \caption{Pairwise activations operate on local feature pairs in the GEMM epilogue.}
+  \label{fig:kernel-1}
+  \vspace{-27pt}
+\end{wrapfigure}
+This form captures several operations in Transformer blocks:
+\begin{itemize}[leftmargin=*,nosep,nolistsep,noitemsep]
+    \item RoPE rotates each feature pair and return two outputs;
+    \item SwiGLU combines gate and value stream into one output;
+    \item SwiGLU backward pass maps one incoming gradient into gradients for both paired inputs.
+\end{itemize}
+Pairwise activations couple neighboring feature lanes and may change the feature dimension. A naive implementation materializes the GEMM output, splits it into paires, and applies the activation in a separate kernel. This adds memory traffic and sometimes materializes an expanded intermediate, as in SwiGLU.
+
+Instead, we arrange paired features to be adjacent along the output-feature dimension. This matches the Hopper Tensor Core accumulator layout exposed to the epilogue, where each thread holds a small tuple of adjacent output values in registers before they are stored. The epilogue can therefore apply $f$ directly to each pair with register-level computation.
+
+This removes the standalone activation kernel and avoids materializing the paired intermediate in global memory. The same idea applies to dimension-preserving operations such as RoPE, dimension-reducing operations such as SwiGLU, and dimension-expanding operations in the backward pass, as long as the pairing is reflected in the GEMM output layout. See~\Cref{fig:gemm-epilogue} for performance benchmarks.
+\begin{figure}[t]
+    \centering
+    \vspace{-15pt}
+    \includegraphics[width=1.0\textwidth]{figs/20260517-fig-1.pdf}
+    \vspace{-15pt}
+    \caption{
+    Kernel-level speedups for representative GEMM-plus-epilogue primitives across $MNK$ sizes. RoPE uses an output dimension of $3N$ for QKV projections, and cross-entropy uses a $32\mathrm{K}$ vocabulary. Speedups are relative to cuBLAS with \texttt{torch.compile}.
+    }
+    \label{fig:gemm-epilogue}
+    \vspace{-10pt}
+\end{figure}
+
+\subsubsection{GEMM with Cross-Entropy Loss}
+\label{sec:gemm-cross-entropy}
+
+Cross-entropy loss can also be expressed as a GEMM with epilogue-side reductions, as shown by Cut Cross-Entropy~\cite{wijmans2025cut}. Let $\vh_i = \vx_i \mW_{\mathrm{lm}}$ be the logits for token $i$, and let $\vy_i$ be its target label. The per-token loss is
+\begin{align*}
+\ell_i
+= -\vh_{i,\vy_i} + \log \sum_k \exp(\vh_{i,k}).
+\end{align*}
+Thus, the loss decomposes into an indexed logit and a row-wise log-sum-exp over vocabulary entries.
+
+Both terms fit the GEMM-plus-epilogue pattern. The indexed logit can be selected from the GEMM output tile using the target label, while the LSE can be accumulated as tile-local maximum and sum-exp statistics. A small auxiliary reduction then combines these statistics across tiles, avoiding a standalone memory-bound softmax over the full logits.\footnote{We use a separate final reduction rather than atomics, and materialize logits to simplify the backward pass.} See \Cref{fig:gemm-epilogue} for performance benchmarks.
+
+
+\subsubsection{Backward Pass}
+\label{sec:backward-gemm-residual-rmsnorm-gemm}
+
+
+The preceding sections show that much of the Transformer forward pass can be reparameterized as GEMMs with epilogues, plus lightweight auxiliary reductions. We now show that the backward pass preserves the same structure.
+
+\paragraph{GEMM with elementwise epilogue.}
+Consider two GEMMs separated by an elementwise epilogue:
+\begin{align*}
+    \vh = \vx \mW_0, \qquad
+    \vh^\prime = f(\vh), \qquad
+    \vy = \vh^\prime \mW_1 ,
+\end{align*}
+where $f$ is applied elementwise. Given an upstream gradient $\nabla_{\vy}\mathcal{L}$, reverse-mode differentiation gives
+\begin{align*}
+    \nabla_{\vh^\prime}\mathcal{L}
+    = \nabla_{\vy}\mathcal{L} \mW_1^\top, \qquad
+    \nabla_{\vh}\mathcal{L}
+    = \nabla_{\vh^\prime}\mathcal{L} \odot f^\prime(\vh), \qquad
+    \nabla_{\vx}\mathcal{L}
+    = \nabla_{\vh}\mathcal{L} \mW_0^\top .
+\end{align*}
+Thus, the backward computation has the same structure as the forward computation: GEMM, local transformation, GEMM. The only difference is the direction of fusion. In the forward pass, $f$ is fused into the epilogue of the \textit{preceding} GEMM that produces $\vh$; in the backward pass, multiplication by $f^\prime(\vh)$ is fused into the epilogue of the \textit{following} GEMM that produces $\nabla_{\vh^\prime}\mathcal{L}$ (\Cref{fig:gemm-epilogue-fwd-bwd}).
+
+\begin{theorem}
+\label{thm:gemm-epilogue-backward}
+Consider a sequence of GEMM-with-epilogue blocks followed by a final GEMM:
+\begin{align*}
+\vh_{\ell} &= \vx_{\ell-1}\mW_{\ell}, \qquad
+\vx_{\ell}[i,j] =
+\vf_{\ell}[i,j]\!\left(\vh_{\ell}[i,j]\right),
+\qquad \ell=1,\ldots,L-1, \\
+\vh_L &= \vx_{L-1}\mW_L .
+\end{align*}
+Assume each tile function $\vf_{\ell}[i,j]$ acts only on its corresponding
+GEMM output tile. Then the activation gradients can be computed with the same
+GEMM-with-epilogue structure:
+\begin{align*}
+\nabla_{\vx_{\ell-1}}\mathcal{L}
+&=
+\nabla_{\vh_{\ell}}\mathcal{L}\mW_{\ell}^{\top}, \qquad
+\nabla_{\vh_{\ell-1}}\mathcal{L}[i,j]
+=
+\vg_{\ell-1}[i,j]\!\left(
+\nabla_{\vx_{\ell-1}}\mathcal{L}[i,j],\;
+\vh_{\ell-1}[i,j]
+\right),
+\qquad \ell=L,\ldots,2, \\
+\nabla_{\vx_0}\mathcal{L}
+&=
+\nabla_{\vh_1}\mathcal{L}\mW_1^{\top}.
+\end{align*}
+Here $\vg_{\ell}[i,j]$ is the tile-local backward rule for
+$\vf_{\ell}[i,j]$: it maps the gradient of the epilogue output tile
+$\vx_{\ell}[i,j]$ to the gradient of the epilogue input tile
+$\vh_{\ell}[i,j]$. The weight gradients are GEMMs:
+\begin{align*}
+\nabla_{\mW_{\ell}}\mathcal{L}
+=
+\vx_{\ell-1}^{\top}\nabla_{\vh_{\ell}}\mathcal{L},
+\qquad \ell=1,\ldots,L .
+\end{align*}
+Thus, tile-local epilogues in the forward pass induce tile-local epilogues in
+the backward pass, while the surrounding linear maps remain GEMMs.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+For the GEMM $\vh_{\ell}=\vx_{\ell-1}\mW_{\ell}$, reverse-mode differentiation gives
+\begin{align*}
+\nabla_{\vx_{\ell-1}}\mathcal{L}
+=
+\nabla_{\vh_{\ell}}\mathcal{L}\mW_{\ell}^{\top},
+\qquad
+\nabla_{\mW_{\ell}}\mathcal{L}
+=
+\vx_{\ell-1}^{\top}\nabla_{\vh_{\ell}}\mathcal{L},
+\end{align*}
+which are both GEMMs. For the epilogue
+$\vx_{\ell}[i,j]=\vf_{\ell}[i,j](\vh_{\ell}[i,j])$, define the local backward
+rule by
+\begin{align*}
+\nabla_{\vh_{\ell}}\mathcal{L}[i,j]
+=
+\vg_{\ell}[i,j]\!\left(
+\nabla_{\vx_{\ell}}\mathcal{L}[i,j],\;
+\vh_{\ell}[i,j]
+\right).
+\end{align*}
+Since each $\vf_{\ell}[i,j]$ depends only on its own tile, the corresponding
+$\vg_{\ell}[i,j]$ also acts only on that tile. The backward pass therefore
+introduces no new cross-tile communication and preserves the
+GEMM-with-epilogue structure.
+\end{proof}
+
+\begin{figure}[t]
+  \centering
+  \vspace{-15pt}
+  \includegraphics[width=\linewidth]{figs/bwd.pdf}
+  \vspace{-17pt}
+  \caption{Forward and backward fusion for GEMM--epilogue blocks. Forward epilogues attach to the GEMM that produces their input, while backward epilogues attach to the GEMM that produces the gradient with respect to their output.}
+  \label{fig:gemm-epilogue-fwd-bwd}
+  \vspace{-10pt}
+\end{figure}
+
+\paragraph{RMSNorm backward.}
+RMSNorm is the main case where the backward pass is not purely tile-local. Its backward rule introduces two reductions: a row-wise statistic needed for the input gradient, and a feature-wise reduction across rows for the RMSNorm weight gradient. A direct implementation computes both in a standalone RMSNorm backward kernel, requiring additional reads of activation-sized tensors.
+However, the row-wise statistic can be moved to a neighboring GEMM boundary. Consider
+\begin{align*}
+\vh_0 = \vx \mW_0, \qquad
+\vh_1 = f(\vh_0), \qquad
+\vh_2 = \operatorname{RMSNorm}(\vh_1,\boldsymbol{\gamma}), \qquad
+\vy = \vh_2 \mW_1 .
+\end{align*}
+RMSNorm backward requires the row-wise inner product
+\begin{align*}
+\vs
+=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \vh_2
+\right).
+\end{align*}
+Using $\nabla_{\vh_2}\mathcal{L}=\nabla_{\vy}\mathcal{L}\mW_1^\top$ and $\vy=\vh_2\mW_1$, this statistic can be equivalently written as
+\begin{align*}
+\vs
+=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vy}\mathcal{L} \odot \vy
+\right).
+\end{align*}
+This identity changes where the statistic is computed. Instead of launching a standalone RMSNorm backward kernel to read $\vh_2$ and $\nabla_{\vh_2}\mathcal{L}$, we accumulate the same row-wise quantity at a boundary where $\vy$ and $\nabla_{\vy}\mathcal{L}$ are already available, thereby exposing the computation to epilogue fusion.
+
+In consecutive Transformer patterns, each GEMM epilogue can therefore accumulate the row-wise statistic needed by the preceding RMSNorm backward. The RMSNorm weight gradient is handled similarly by emitting tile partials for the reduction across rows. Overall, RMSNorm backward becomes GEMM--epilogue kernels plus lightweight auxiliary reductions over tile partials. We give the full derivation and kernel organization in \Cref{sec:backward-rmsnorm-epilogue}, with benchmarks in \Cref{fig:block-experiments}.
+
+\subsection{Implementation}
+\label{sec:implementations}
+
+We implement \texttt{CODA} on top of CuTeDSL, which provides Python-level kernel authoring while retaining low-level control over details such as layouts and memory movement.
+
+\textbf{Data movement.}
+Vector loads handle small broadcast operands such as RMSNorm weights. These values are staged once in shared memory and reused across subtiles. Tile loads handle larger operands such as residual activations, and uses Tensor Memory Accelerator transfers between global memory and shared memory, allowing data movement to overlap with epilogue computation. Stores follow similar tile-granular path for transformed outputs, saved intermediates, and reduction partials.
+
+\textbf{Local computation.}
+Pairwise maps act on neighboring features, covering dimension-preserving operations such as RoPE, dimension-reducing operations such as SwiGLU, and dimension-expanding operations in the backward pass. When a map changes the feature dimension, the epilogue performs the corresponding local layout adjustment, such as compacting dimension-reducing outputs or packing pairs of 16-bit values for dimension-expanding outputs.
+
+\textbf{Reductions.}
+Tile-wise reductions follow the ownership of GEMM output fragments. Row-wise reductions are accumulated by the warp that owns the row. Column-wise reductions may span multiple warps, so each warp first produces a partial result, and these partials are combined through shared memory.
+
+\subsubsection{LLM-Oriented Authoring}
+\label{sec:llm-kernel-authoring}
+
+\texttt{CODA} is designed both for LLM workloads and for LLM-assisted authoring. Rather than asking a model to synthesize arbitrary CUDA or discover a hardware schedule from scratch, \texttt{CODA} exposes a constrained space of epilogue programs around expert-designed GEMM mainloops. Its primitives already encode efficient implementation strategies, so LLM-based authoring becomes a problem of composing vector loads, tile loads, pairwise maps, reductions, and stores for a given Transformer computation. This lightweight use of LLMs is complementary to prior work on kernel generation, which often relies on orchestration, search, execution feedback, or post-training~\cite{ouyang2025kernelbench,su2025cuda,chen2025cuda,lange2025towards,yuksekgonul2026learning}.
+
+Because CuTeDSL is relatively new, current models have limited exposure to its idioms. We therefore provide curated demonstrations for each abstraction. In practice, the repository itself acts as a growing demonstration set, with new kernels being written by adapting and composing existing examples.
+
+\paragraph{Compositions.}
+Transformer kernels often combine several epilogue operations, such as residual addition and RMSNorm scaling. Monolithic fused epilogues lead to large, repetitive implementations that are difficult to place in context. \texttt{CODA} instead represents each epilogue as a composition of reusable primitives: the LLM specifies the local epilogue program, while the library supplies the fixed GEMM mainloop and implementation pattern for each primitive. New fused kernels are therefore assembled from reusable building blocks instead of being rewritten from scratch.
+
+
+
+
+
+

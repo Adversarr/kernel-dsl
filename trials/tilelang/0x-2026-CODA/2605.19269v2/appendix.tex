@@ -1,0 +1,448 @@
+\section{Backward Pass}
+
+\subsection{Tile-wise Epilogue}
+\label{sec:tile-wise-epilogue}
+
+Partition the GEMM output $\vh$ into tiles $\vh_{[i,j]}$. A tile-wise epilogue applies an independent transformation to each tile:
+\begin{align*}
+\vh &= \vx \mW_0, \qquad
+\vh^\prime =
+\begin{bmatrix}
+\vf[0,0]\left(\vh[0,0]\right) & \cdots & \vf[0,N]\left(\vh[0,N]\right) \\
+\vdots & \ddots & \vdots \\
+\vf[M,0]\left(\vh[M,0]\right) & \cdots & \vf[M,N]\left(\vh[M,N]\right)
+\end{bmatrix},
+\qquad
+\vy = \vh^\prime \mW_1 .
+\end{align*}
+
+The backward pass has the same block structure.
+\begin{equation*}
+\footnotesize    
+\begin{aligned}
+\nabla_{\vh^\prime}\mathcal{L}
+&= \nabla_{\vy}\mathcal{L}\mW_1^\top, \qquad
+\nabla_{\vh}\mathcal{L} =
+\begin{bmatrix}
+\vg[0,0]\left(\nabla_{\vh^\prime}\mathcal{L}[0,0]\right) & \cdots & \vg[0,N]\left(\nabla_{\vh^\prime}\mathcal{L}[0,N]\right) \\
+\vdots & \ddots & \vdots \\
+\vg[M,0]\left(\nabla_{\vh^\prime}\mathcal{L}[M,0]\right) & \cdots & \vg[M,N]\left(\nabla_{\vh^\prime}\mathcal{L}[M,N]\right)
+\end{bmatrix},
+\qquad
+\nabla_{\vx}\mathcal{L}
+= \nabla_{\vh}\mathcal{L}\mW_0^\top .
+\end{aligned}
+\end{equation*}
+Here each $\vg[i,j]$ is the local backward rule for the corresponding tile:
+\begin{align*}
+\vg[i,j](\Delta)
+=
+\operatorname{unvec}\!\left(
+\mJ_{[i,j]}^\top \operatorname{vec}(\Delta)
+\right),
+\qquad
+\mJ_{[i,j]}
+=
+\frac{\partial \operatorname{vec}\left(f[i,j]\left(\vh[i,j]\right)\right)}
+     {\partial \operatorname{vec}\left(\vh[i,j]\right)}.
+\end{align*}
+
+Thus, each gradient tile depends only on the corresponding forward tile and upstream gradient tile. No cross-tile communication is introduced, so the backward operation remains tile-local and can be implemented as a GEMM epilogue. As shown in \Cref{fig:gemm-epilogue-fwd-bwd}, the only structural change is the direction of fusion: forward epilogues are fused into the GEMM that produces their input, while backward epilogues are fused into the GEMM that produces the gradient with respect to their output.
+
+\subsection{GEMM-RMSNorm-GEMM Backward Pass}
+\label{sec:backward-rmsnorm-epilogue}
+
+We now describe the backward pass for the GEMM--epilogue--RMSNorm--GEMM pattern. RMSNorm is the first case where the backward pass is not purely tile-local. The reason is simple: RMSNorm contains a row-wise normalization factor, so its backward pass needs a row-wise statistic. In addition, the RMSNorm weight $\boldsymbol{\gamma}$ is shared across rows, so its gradient requires a reduction across the row dimension. The goal of this section is to show that these are the only non-local pieces. Everything else can still be fused into GEMM epilogues, with the non-local pieces handled by lightweight reductions over tile partials.
+
+Consider the forward computation
+\begin{align*}
+\vh_0 &= \vx \mW_0, \qquad
+\vh_1 = f(\vh_0), \qquad
+\vh_2 = \operatorname{RMSNorm}(\vh_1, \boldsymbol{\gamma}), \qquad
+\vy = \vh_2 \mW_1 .
+\end{align*}
+Let $\vr$ be the row-wise inverse RMS factor. We write
+$\overline{\vr} = \vr \mathbf{1}^{\top}$ and
+$\overline{\boldsymbol{\gamma}} = \mathbf{1}\boldsymbol{\gamma}^{\top}$
+for the broadcasts of $\vr$ and $\boldsymbol{\gamma}$ to the shape of $\vh_1$. Then
+\begin{align*}
+\vh_2
+=
+\overline{\vr} \odot \vh_1 \odot \overline{\boldsymbol{\gamma}} .
+\end{align*}
+
+Given the upstream gradient $\nabla_{\vy}\mathcal{L}$, the first backward operation is the GEMM
+\begin{align*}
+\nabla_{\vh_2}\mathcal{L}
+=
+\nabla_{\vy}\mathcal{L}\mW_1^\top .
+\end{align*}
+The RMSNorm backward can be written as
+\begin{align*}
+\nabla_{\vh_1}\mathcal{L}
+&=
+\overline{\vr} \odot
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \overline{\boldsymbol{\gamma}}
+-
+\overline{\vr} \odot \vh_1 \odot \overline{\vs}
+\right), \\
+\nabla_{\boldsymbol{\gamma}}\mathcal{L}
+&=
+\operatorname{sum}_{\mathrm{rows}}
+\left(
+\nabla_{\vh_2}\mathcal{L}
+\odot \vh_1
+\odot \overline{\vr}
+\right),
+\end{align*}
+where $\overline{\vs} = \vs \mathbf{1}^{\top}$ broadcasts one scalar per row. The row-wise statistic $\vs$ is
+\begin{align*}
+\vs
+&=
+\frac{1}{d}
+\odot \vr \odot
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \overline{\boldsymbol{\gamma}} \odot \vh_1
+\right), \\
+&=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \overline{\vr} \odot \overline{\boldsymbol{\gamma}} \odot \vh_1
+\right), \\
+&=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \vh_2
+\right),
+\end{align*}
+where $d$ is the hidden dimension. This expression identifies the two non-local operations in RMSNorm backward. The statistic $\vs$ is a reduction across columns, producing one scalar per row. The weight gradient $\nabla_{\boldsymbol{\gamma}}\mathcal{L}$ is a reduction across rows, producing one scalar per hidden feature.
+
+A standalone RMSNorm backward kernel would compute these reductions by reading activation-sized tensors. The key observation is that the row-wise statistic $\vs$ can be moved to a different boundary. Using $\nabla_{\vh_2}\mathcal{L} = \nabla_{\vy}\mathcal{L} \, \mW_1^\top$ and
+$\vy = \vh_2 \mW_1$, we have
+\begin{align*}
+\vs
+&=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \vh_2
+\right), \\
+&=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+(\nabla_{\vy}\mathcal{L}\mW_1^\top) \odot \vh_2
+\right) \\
+&=
+\frac{1}{d}
+\operatorname{diag}
+\left(
+(\nabla_{\vy}\mathcal{L}\mW_1^\top) \; \vh_2^\top
+\right) \\
+&=
+\frac{1}{d}
+\operatorname{diag}
+\left(
+\nabla_{\vy}\mathcal{L} \; (\vh_2 \mW_1)^\top
+\right) \\
+&=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{cols}}
+\left(
+\nabla_{\vy}\mathcal{L} \odot (\vh_2 \mW_1)
+\right) \\
+&=
+\frac{1}{d}
+\operatorname{sum}_{\mathrm{output}}
+\left(
+\nabla_{\vy}\mathcal{L} \odot \vy
+\right).
+\end{align*}
+Intuitively, the RMSNorm backward needs the inner product between an activation and its gradient along each row. The identity above says that this inner product can be computed either before or after the following GEMM. This lets us compute the statistic at a boundary where $\vy$ and $\nabla_{\vy}\mathcal{L}$ are already available.
+
+This is useful because Transformer layers contain consecutive GEMM--epilogue--RMSNorm--GEMM patterns. During the backward pass of one pattern, the GEMM that produces $\nabla_{\vx}\mathcal{L}$ already has access to both $\vx$ and $\nabla_{\vx}\mathcal{L}$. Since this $\vx$ is the output of the preceding pattern, the epilogue of the current pattern can accumulate the RMSNorm statistic needed by the preceding pattern:
+\begin{align*}
+\widehat{\vs}_{\mathrm{prev}}
+=
+\operatorname{reduceTile}_{\mathrm{cols}}
+\left(
+\vx \odot \nabla_{\vx}\mathcal{L}
+\right),
+\qquad
+\vs_{\mathrm{prev}}
+=
+\frac{1}{d}
+\operatorname{reduce}
+\left(
+\widehat{\vs}_{\mathrm{prev}}
+\right).
+\end{align*}
+Thus, each pattern computes the row-wise RMSNorm backward statistic required by the pattern before it. The reduction is still present, but it is now a small reduction over tile partials rather than a standalone activation-sized RMSNorm backward kernel.
+
+The RMSNorm weight gradient is handled similarly, except that its reduction is across rows rather than columns. We accumulate tile partials in the RMSNorm backward epilogue:
+\begin{align*}
+\widehat{\nabla_{\boldsymbol{\gamma}}\mathcal{L}}
+=
+\operatorname{reduceTile}_{\mathrm{rows}}
+\left(
+\nabla_{\vh_2}\mathcal{L}
+\odot \vh_1
+\odot \overline{\vr}
+\right),
+\qquad
+\nabla_{\boldsymbol{\gamma}}\mathcal{L}
+=
+\operatorname{reduce}_{\mathrm{rows}}
+\left(
+\widehat{\nabla_{\boldsymbol{\gamma}}\mathcal{L}}
+\right).
+\end{align*}
+
+Putting these pieces together, the backward pass is organized as follows:
+\begin{align*}
+\text{GEMM 1:}\quad
+\nabla_{\vh_2}\mathcal{L}
+&=
+\nabla_{\vy}\mathcal{L}\mW_1^\top, \\
+\text{Epilogue 1:}\quad
+\nabla_{\vh_1}\mathcal{L}
+&=
+\overline{\vr} \odot
+\left(
+\nabla_{\vh_2}\mathcal{L} \odot \overline{\boldsymbol{\gamma}}
+-
+\vh_1 \odot \overline{\vr} \odot \overline{\vs}
+\right), \\
+\nabla_{\vh_0}\mathcal{L}
+&=
+g(\nabla_{\vh_1}\mathcal{L}), \\
+\widehat{\nabla_{\boldsymbol{\gamma}}\mathcal{L}}
+&=
+\operatorname{reduceTile}_{\mathrm{rows}}
+\left(
+\nabla_{\vh_2}\mathcal{L}
+\odot \vh_1
+\odot \overline{\vr}
+\right), \\ \\
+\text{GEMM 2:}\quad
+\nabla_{\vx}\mathcal{L}
+&=
+\nabla_{\vh_0}\mathcal{L}\mW_0^\top, \\
+\text{Epilogue 2:}\quad
+\widehat{\vs}_{\mathrm{prev}}
+&=
+\operatorname{reduceTile}_{\mathrm{cols}}
+\left(
+\vx \odot \nabla_{\vx}\mathcal{L}
+\right), \\ \\
+\text{Auxiliary reductions:}\quad
+\vs_{\mathrm{prev}}
+&=
+\frac{1}{d}
+\operatorname{reduce}_{\mathrm{cols}}
+\left(
+\widehat{\vs}_{\mathrm{prev}}
+\right), \\
+\nabla_{\boldsymbol{\gamma}}\mathcal{L}
+&=
+\operatorname{reduce}_{\mathrm{rows}}
+\left(
+\widehat{\nabla_{\boldsymbol{\gamma}}\mathcal{L}}
+\right).
+\end{align*}
+Here $g$ denotes the tile-local backward rule for the epilogue $f$. The statistic $\vs$ used in \text{Epilogue 1} is assumed to have already been accumulated by the following pattern in the backward order.
+
+Finally, the output of a pattern often passes through another epilogue before the next pattern begins:
+\begin{align*}
+\vh_0 &= \vx \mW_0, \qquad
+\vh_1 = f_0(\vh_0), \qquad
+\vh_2 = \operatorname{RMSNorm}(\vh_1, \boldsymbol{\gamma}), \qquad
+\vh_3 = \vh_2 \mW_1
+\qquad \vy = f_1(\vh_3).
+\end{align*}
+In this case, the statistic should be accumulated using the pre-epilogue tensor $\vh_3$ and its gradient. The backward rule for $f_1$ is tile-local, so it can be fused before accumulating the statistic:
+\begin{align*}
+\text{GEMM 2:}\quad
+\nabla_{\vx}\mathcal{L}
+&=
+\nabla_{\vh_0}\mathcal{L}\mW_0^\top, \\
+\text{Epilogue 2:}\quad
+\nabla_{\overleftarrow{\vh_3}}\mathcal{L}
+&=
+\overleftarrow{f_1}(\nabla_{\vx}\mathcal{L}), \\
+\widehat{\vs}_{\mathrm{prev}}
+&=
+\operatorname{reduceTile}_{\mathrm{cols}}
+\left(
+\overleftarrow{\vh_3} \odot \nabla_{\overleftarrow{\vh_3}}\mathcal{L}
+\right)
+\end{align*}
+Here $\overleftarrow{\vh_3}$ denotes the pre-epilogue GEMM output from the preceding pattern, and $\overleftarrow{f_1}$ denotes the local backward rule for its following epilogue. This case preserves the same structure: apply the local backward epilogue first, then accumulate the row-wise statistic from the pre-epilogue activation and its gradient.
+
+Overall, this organization removes the activation-sized RMSNorm backward kernel. The remaining non-local work consists only of reductions over tile partials: a column reduction for the row-wise RMSNorm statistic, and a row reduction for the RMSNorm weight gradient. The GEMMs and local backward updates are fused into GEMM epilogues, preserving the same GEMM-plus-epilogue structure used in the forward pass.
+
+\section{CODA}
+\subsection{Epilogue Template}
+\label{label:evt-template}
+\input{figs/evt}
+\subsection{Epilogue Example}
+\label{label:evt-example}
+\input{figs/example}
+
+\section{Experiments}
+\subsection{List of Kernels}
+\label{sec:list-of-kernels}
+
+We summarize the kernels implemented in \texttt{CODA}. Each kernel is a GEMM followed by an epilogue program.
+
+\subsubsection{Basic Epilogue Kernels}
+
+We first list three basic GEMM-plus-epilogue kernels. These are useful for isolating individual epilogue primitives, although they are not always used directly in the Transformer forward pass.
+
+\textbf{Kernel 1: GEMM with RoPE.}
+This kernel applies RoPE~\cite{su2024roformer} to pairs of adjacent features in the GEMM output:
+\begin{align*}
+\mD &= \mA\mB, \\
+\mO &= \operatorname{RoPE}(\mD).
+\end{align*}
+
+\textbf{Kernel 2: GEMM with SwiGLU.}
+This kernel applies a fused SwiGLU activation to an interleaved GEMM output:
+\begin{align*}
+\mD &= \mA\mB, \\
+[\mG,\mU] &= \operatorname{interleavedSplit}(\mD), \\
+\mO &= \operatorname{silu}(\mG) \odot \mU.
+\end{align*}
+
+\textbf{Kernel 3: GEMM with partial cross-entropy.}
+This kernel computes logits, selects the target logit, and emits block-wise log-sum-exp statistics for the cross-entropy loss:
+\begin{align*}
+\mZ &= \mA\mB, \\
+\vz_{\mathrm{tgt}} &= \mZ[\vy], \\
+\widehat{\vl}_{\mathrm{lse}} &= \operatorname{reduceTile}_{\log\sum\exp}(\mZ).
+\end{align*}
+
+\subsubsection{Forward-Pass Kernels}
+
+The following kernels implement the reparameterized Transformer forward pass. They compose the basic epilogue primitives with RMSNorm scaling, residual updates, and partial reductions.
+
+\textbf{Kernel 4: GEMM with residual, partial RMSNorm, and weight scaling.}
+This kernel implements the first stage of the GEMM--Residual--RMSNorm--GEMM pattern. It forms the residual-updated activation, emits partial RMS statistics, and applies the RMSNorm weight:
+\begin{align*}
+\mD &= \mA\mB + \mC, \\
+\widehat{\vr} &= \operatorname{reduceTile}_{\mathrm{cols}}(\mD \odot \mD), \\
+\mO &= \mD \odot \boldsymbol{\gamma}.
+\end{align*}
+
+\textbf{Kernel 5: GEMM with RMSNorm scaling.}
+This kernel consumes a precomputed row-wise normalization factor and applies it in the GEMM epilogue:
+\begin{align*}
+\mD &= \mA\mB, \\
+\mO &= \mD \odot \vr.
+\end{align*}
+
+\textbf{Kernel 6: GEMM with RMSNorm and SwiGLU.}
+This kernel composes row-wise RMSNorm scaling with SwiGLU, corresponding to the MLP gate/up projection:
+\begin{align*}
+\mD &= \mA\mB, \\
+\mD^{\prime} &= \mD \odot \vr, \\
+[\mG,\mU] &= \operatorname{interleavedSplit}(\mD^{\prime}), \\
+\mO &= \operatorname{silu}(\mG) \odot \mU.
+\end{align*}
+
+\textbf{Kernel 7: GEMM with RMSNorm and RoPE.}
+This kernel composes row-wise RMSNorm scaling with RoPE, corresponding to QKV projection followed by rotary positional embedding:
+\begin{align*}
+\mD &= \mA\mB, \\
+\mD^{\prime} &= \mD \odot \vr, \\
+\mO &= \operatorname{RoPE}(\mD^{\prime}).
+\end{align*}
+
+\textbf{Kernel 8: GEMM with RMSNorm and partial cross-entropy.}
+This kernel adds row-wise RMSNorm scaling before target-logit selection and partial log-sum-exp reduction, corresponding to the language-modeling head:
+\begin{align*}
+\mZ &= (\mA\mB) \odot \vr, \\
+\vz_{\mathrm{tgt}} &= \mZ[\vy], \\
+\widehat{\vl}_{\mathrm{lse}} &= \operatorname{reduceTile}_{\log\sum\exp}(\mZ).
+\end{align*}
+
+\subsubsection{Backward-Pass Kernels}
+
+Finally, we list the backward kernels. These kernels mirror the forward structure: each performs a GEMM, applies the local backward rule in the epilogue, and emits partial reductions needed by neighboring RMSNorm backward computations.
+
+\textbf{Kernel 9: GEMM with residual and RMSNorm backward.}
+This kernel implements the local part of RMSNorm backward. Let $\mC$ denote the RMSNorm input, $\vr$ the row-wise inverse RMS factor, $\boldsymbol{\gamma}$ the RMSNorm weight, and $\vz_{\Delta z}$ the row-wise RMSNorm backward statistic:
+\begin{align*}
+\mD &= \mA\mB^{\top}, \\
+\mC_{\mathrm{norm}} &= \mC \odot \vr, \\
+\mO_{\mathrm{out}}
+&=
+\mO_{\mathrm{in}}
++
+\left(
+\mD \odot \boldsymbol{\gamma}
+-
+\mC_{\mathrm{norm}} \odot \vz_{\Delta z}
+\right)
+\odot \vr, \\
+\mC_{\mathrm{out}}
+&=
+\mC_{\mathrm{norm}} \odot \boldsymbol{\gamma}, \\
+\widehat{\nabla_{\boldsymbol{\gamma}}\mathcal{L}}
+&=
+\operatorname{reduceTile}_{\mathrm{rows}}
+\left(
+\mD \odot \mC_{\mathrm{norm}}
+\right).
+\end{align*}
+
+\textbf{Kernel 10: GEMM with SwiGLU backward.}
+This kernel computes the backward pass of a fused SwiGLU epilogue and emits the row-wise statistic needed by the preceding RMSNorm backward. Let $\mZ$ be the saved interleaved pre-activation tensor:
+\begin{align*}
+\mD &= \mA\mB^{\top}, \\
+[\mG,\mU] &= \operatorname{interleavedSplit}(\mZ), \\
+\mO &= \operatorname{silu}(\mG) \odot \mU, \\
+\nabla_{\mU}\mathcal{L}
+&=
+\mD \odot \operatorname{silu}(\mG), \\
+\nabla_{\mG}\mathcal{L}
+&=
+\mD \odot \mU \odot
+\left(
+\sigma(\mG)
++
+\operatorname{silu}(\mG) \odot (1-\sigma(\mG))
+\right), \\
+\nabla_{\mZ}\mathcal{L}
+&=
+\operatorname{interleavedConcat}
+\left(
+\nabla_{\mG}\mathcal{L},
+\nabla_{\mU}\mathcal{L}
+\right), \\
+\widehat{\vz_{\Delta z}}
+&=
+\operatorname{reduceTile}_{\mathrm{cols}}
+\left(
+\mG \odot \nabla_{\mG}\mathcal{L}
++
+\mU \odot \nabla_{\mU}\mathcal{L}
+\right).
+\end{align*}
+
+\subsection{Setup Details}
+\label{sec:setup-details}
+Experiments are conducted using a single H100 GPU. We use the following package versions.
+\begin{enumerate}
+    \item PyTorch 2.10.0
+    \item CuTeDSL 4.4.2
+    \item Liger Kernels 0.8.0
+    \item FlashInfer 0.6.10.post1
+    \item QuACK Kernels 0.4.1
+\end{enumerate}
+
+

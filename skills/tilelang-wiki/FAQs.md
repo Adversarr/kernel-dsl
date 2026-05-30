@@ -66,6 +66,64 @@ interleaved real/imag fragment accesses inside `T.Parallel(...)`. Either split
 the lanes into separate buffers or move the pair extraction outside the parallel
 region.
 
+## [Question] A FullRow GEMM accumulator stores interleaved gate/up pairs, and the postprocess has to split them out manually
+
+Another manifestation of the same limitation appears in GEMM-driven pairwise
+epilogues such as RMSNorm + SwiGLU.
+
+Suppose a GEMM writes one fragment tile `acc` whose columns are interleaved as:
+
+```text
+[gate_0, up_0, gate_1, up_1, ...]
+```
+
+The natural postprocess is to read sibling lanes from the same accumulator,
+for example:
+
+```python
+gate = acc[i, j * 2]
+up = acc[i, j * 2 + 1]
+```
+
+In current TileLang lowering, that sibling-fragment access pattern is the same
+known issue as the minimal repro above. Even when the larger kernel is
+restructured to extract `gate_frag` and `up_frag` in separate `T.Parallel(...)`
+loops before applying RMSNorm and SwiGLU, that split is still a workaround for
+the underlying layout-inference restriction.
+
+This is why a larger fused kernel may end up written in the more awkward form:
+
+```python
+gate_frag = T.alloc_fragment((block_M, paired_outputs_per_tile), accum_dtype)
+up_frag = T.alloc_fragment((block_M, paired_outputs_per_tile), accum_dtype)
+
+for i, j in T.Parallel(block_M, paired_outputs_per_tile):
+    gate_frag[i, j] = acc[i, j * 2]
+for i, j in T.Parallel(block_M, paired_outputs_per_tile):
+    up_frag[i, j] = acc[i, j * 2 + 1]
+```
+
+rather than reading both sibling lanes directly in one pairwise epilogue loop.
+
+By contrast, Triton does not suffer from this specific layout-inference failure,
+so the analogous fused GEMM + RMSNorm + SwiGLU implementation can keep the
+pairwise logic in a more natural form, either by using separate accumulators for
+gate and up or by reshaping/selecting lanes from an interleaved accumulator.
+
+Practical workarounds in TileLang are:
+
+1. Split the sibling lanes into separate buffers before the main pairwise
+   `T.Parallel(...)` postprocess.
+2. Materialize the interleaved result through shared memory before re-reading
+   pair members.
+3. Change the computation so gate and up are produced by separate GEMM paths or
+   separate weight layouts instead of one interleaved fragment tile.
+
+Rule of thumb: if a fragment produced by `T.gemm(...)` represents logical pairs
+such as gate/up, real/imag, or even/odd lanes, treat direct sibling reads from
+that fragment inside `T.Parallel(...)` as fragile. Split the lanes first, or
+store them in a layout that avoids pair extraction from one fragment buffer.
+
 ## [Question] Layout infer conflict
 
 If you hit an error like:

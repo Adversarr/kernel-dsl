@@ -1,0 +1,34 @@
+\section{Introduction}
+
+
+\begin{wrapfigure}{r}{0.39\textwidth}
+    \centering
+    \vspace{-27pt}
+    \includegraphics[width=0.99\linewidth]{figs/profile-v2.pdf}
+    \vspace{-17pt}
+    \caption{Runtime breakdown for LLaMA-3-style 1B model training on a single H100 using TorchTitan.}
+    \vspace{-13pt}
+    \label{fig:runtime}
+\end{wrapfigure}
+LLM training has become just as much of a systems problem as a modeling one.
+FLOPs in modern Transformer-based LLMs are dominated by matrix multiplications and attention, whose kernels have been heavily optimized for Tensor Core execution. Yet Transformers, and deep learning architectures more broadly, also contain normalization, activations, residual updates, reductions, and other bandwidth-limited operations that move large tensors through memory while doing little arithmetic. Prior work has shown that data movement is a central bottleneck in Transformer training~\cite{ivanov2021data}; as \Cref{fig:runtime} shows, when training a LLaMA-3-style 1B model on a single H100 using TorchTitan~\cite{liang2024torchtitan}, these non-GEMM operations account for a nontrivial fraction of end-to-end runtime. As hardware increasingly accelerates low-precision matrix multiplication through formats such as FP8 and FP4, this bottleneck is becoming more important, as the cost of materializing intermediate tensors does not improve at the same rate.
+
+Existing programming models make this issue difficult to address. High-level frameworks such as PyTorch express Transformer blocks as operator sequences, with autograd making the backward pass similarly convenient. This is productive, but operator boundaries often become materialization boundaries and obscure fusion opportunities across forward and backward computation. Production-level LLM systems therefore often bypass framework abstractions with hand-written backward passes or custom kernels, as in large-scale LLaMA training~\cite{grattafiori2024llama} and inference systems~\cite{kwon2023efficient,zheng2024sglang}. This work asks whether there is a middle ground. That is, is it possible to  recover much of the performance of custom kernels without giving up the structure needed for programmability and automation?
+
+Our starting observation is that many Transformer computations that appear at the framework level as separate operators can be algebraically reparameterized as GEMM-plus-epilogue programs (\cref{fig:fwd-pass}). In this form, a highly optimized GEMM mainloop produces output tiles, while a programmable epilogue performs tile-local transformations before the result is written to memory (\cref{fig:mainloop-epilogue}). This is efficient on GPUs because the epilogue operates on data that is already produced by the GEMM tile, avoiding additional global-memory round trips for intermediate tensors. With modern pipelined schedules, this epilogue work can often be placed in the shadow of other tiles' mainloops, as in Hopper Ping-Pong GEMM and Blackwell TMEM-based pipelines.
+Thus, we extend the epilogue beyond a place for simple post-processing such as scaling or bias addition, elevating it into a structured interface for fusing memory-bound computation into the lifetime of a GEMM tile.
+
+Based on the above, we introduce \texttt{CODA}, a kernel abstraction prototype that realizes this interface. \texttt{CODA} keeps the GEMM mainloop fixed and exposes a small set of composable epilogue primitives for scaling, reductions, pairwise transformations, and accumulation. This programming model is deliberately constrained and yet expressive, as after reparameterization, these primitives cover nearly the entire forward and backward pass of a standard Transformer model while preserving efficiency. \texttt{CODA} inserts computation into the epilogue of a known high-performance GEMM before intermediate tensors are materialized in global memory, capturing a broad class of memory-bound computations surrounding dense linear algebra. Transformers are our primary application, but the same GEMM-plus-epilogue view applies more broadly whenever high-throughput matrix multiplication is surrounded by tile-expressible, data-movement-bound computations.
+
+Finally, this structure makes automation more practical. Epilogue fusion is already established in high-performance GEMM libraries, but applying it to Transformer workloads remains a low-level engineering task. \texttt{CODA} targets this gap by providing Transformer-specific epilogue primitives on top of a tuned GEMM mainloop. Human or LLM-based authors can assemble these primitives into reparameterized Transformer kernels rather than synthesizing arbitrary CUDA. Across representative workloads, both authoring modes achieve high performance, suggesting that domain-specific epilogue abstractions can make established GEMM fusion techniques more programmable for LLM kernels.
+
+
+
+\begin{figure*}[t]
+    \centering
+    \vspace{-15pt}
+    \includegraphics[width=0.99\textwidth]{figs/fwd.pdf}
+    \caption{Forward pass of a standard Transformer layer. The top row shows the canonical formulation, which maps to a mix of compute- and memory-bound kernels. We reparameterize the computation so that most memory-bound operations are subsumed into the epilogues of compute-bound kernels.}
+    \vspace{-17pt}
+    \label{fig:fwd-pass}
+\end{figure*}

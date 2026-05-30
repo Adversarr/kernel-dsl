@@ -9,7 +9,8 @@ TileLang is a Python-first DSL for writing high-performance kernels for targets
 such as CUDA and HIP. The local material in this directory is the source of
 truth for semantics and guidance in this skill. Use `../examples/README.md` for
 the example catalogue and operator inventory. Use `../FAQs.md` for known
-failure modes and issue-driven debugging shortcuts.
+failure modes and issue-driven debugging shortcuts. Use `god_blessing/` for
+undocumented or lightly documented details that still matter in practice.
 
 ## Start Here
 
@@ -49,6 +50,9 @@ Use the rest of the local docs by intent:
   - `deeplearning_operators/matmul.md`
   - `deeplearning_operators/matmul_sparse.md`
   - `deeplearning_operators/deepseek_mla.md`
+- undocumented but useful details:
+  - `god_blessing/magic_enums.md`
+  - `god_blessing/pass_config.md`
 - compiler and runtime internals:
   - `compiler_internals/letstmt_inline.md`
   - `compiler_internals/inject_fence_proxy.md`
@@ -477,6 +481,9 @@ Open these pages next depending on the question:
 - debugging:
   - `tutorials/debug_tools_for_tilelang.md`
   - `tutorials/logging.md`
+- undocumented but practical details:
+  - `god_blessing/magic_enums.md`
+  - `god_blessing/pass_config.md`
 - internals:
   - `compiler_internals/letstmt_inline.md`
   - `compiler_internals/inject_fence_proxy.md`

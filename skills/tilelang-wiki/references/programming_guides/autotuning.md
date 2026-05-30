@@ -353,6 +353,33 @@ Automatic input generation is convenient for static tensor-only kernels. For
 symbolic shapes, dynamic values, scalar inputs, or unusual dtype requirements,
 provide explicit inputs.
 
+Keep the kernel factory closure serializable. `AutoTuner.run()` inspects the
+factory closure when it hashes and schedules tuning work, so avoid capturing
+live `torch.Tensor` objects in the closure. Hoist tensor-derived metadata such
+as shape integers, TileLang dtypes, booleans, and scalar constants first, then
+capture only those serializable values:
+
+```python
+rope_dtype = torch_dtype_to_tilelang_dtype(q.dtype)
+freq_dtype = torch_dtype_to_tilelang_dtype(freqs.dtype)
+batch, seq_len, heads, head_dim = q.shape
+
+def kernel(block_M=None, threads=None):
+    return make_kernel(
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        head_dim=head_dim,
+        block_M=block_M,
+        threads=threads,
+        dtype=rope_dtype,
+        freq_dtype=freq_dtype,
+    )
+```
+
+If you instead capture a tensor directly, the autotuner can fail early with a
+message that the closure cell contents are not serializable.
+
 ## Caching
 
 TileLang caches autotune results in memory and on disk when caching is enabled.
@@ -536,5 +563,8 @@ device-aware candidate generation instead of a raw Cartesian product.
 - Cached inputs have incompatible shape or dtype across configs: set
   `cache_input_tensors=False` or provide a `supply_prog` that regenerates inputs
   per candidate.
+- `Cell contents ... is not serializable`: remove captured `torch.Tensor`
+  objects from the kernel-factory closure and capture only shapes, dtypes,
+  flags, and other scalar metadata.
 - Disk cache does not appear: check `TILELANG_DISABLE_CACHE`,
   `TILELANG_AUTO_TUNING_DISABLE_CACHE`, and the selected execution backend.

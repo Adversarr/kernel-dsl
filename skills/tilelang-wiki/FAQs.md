@@ -1,5 +1,71 @@
 # Frequently Asked Questions
 
+## [Question] `ParallelOpNode::RecordBufferAccess` fails on an interleaved complex tile
+
+If you hit an error like:
+
+```text
+tvm.error.InternalError: Check failed: (StructuralEqual()(it->second.indices, indices)) is false: q_tile: (tid * 2 + 1,) and (tid * 2,)
+```
+
+or the 2D variant:
+
+```text
+tvm.error.InternalError: Check failed: (StructuralEqual()(it->second.indices, indices)) is false: q_tile: (tid, 1) and (tid, 0)
+```
+
+inside a `T.Parallel(...)` loop, a common cause is using one fragment buffer to
+represent interleaved complex lanes and then reading sibling indices such as
+real/imag from that same buffer in the parallel loop body.
+
+This shows up naturally in RoPE-style kernels where the host data is laid out as
+`[..., head_dim]`, but the kernel tries to treat it as complex pairs by loading
+one tile and then accessing:
+
+```python
+q_real = q_tile[pair_idx, 0]
+q_imag = q_tile[pair_idx, 1]
+```
+
+or:
+
+```python
+q_real = q_tile[real_idx]
+q_imag = q_tile[imag_idx]
+```
+
+In current TileLang lowering, that access pattern can attach incompatible access
+records to the same parallel buffer and fail during layout inference.
+
+The robust workaround is to split the lanes into separate buffers before the
+parallel loop:
+
+```python
+q_real_tile = T.alloc_fragment((tile_pairs,), dtype)
+q_imag_tile = T.alloc_fragment((tile_pairs,), dtype)
+freq_real_tile = T.alloc_fragment((tile_pairs,), freq_dtype)
+freq_imag_tile = T.alloc_fragment((tile_pairs,), freq_dtype)
+
+T.copy(q[..., 0], q_real_tile)
+T.copy(q[..., 1], q_imag_tile)
+T.copy(freqs[..., 0], freq_real_tile)
+T.copy(freqs[..., 1], freq_imag_tile)
+```
+
+Then use one stable index per buffer inside `T.Parallel(...)`:
+
+```python
+for tid, lane in T.Parallel(threads, elements_per_thread):
+    pair_idx = tid * elements_per_thread + lane
+    q_real = q_real_tile[pair_idx]
+    q_imag = q_imag_tile[pair_idx]
+```
+
+Rule of thumb: for complex-number or pairwise kernels, do not rely on
+interleaved real/imag fragment accesses inside `T.Parallel(...)`. Either split
+the lanes into separate buffers or move the pair extraction outside the parallel
+region.
+
 ## [Question] Layout infer conflict
 
 If you hit an error like:
@@ -151,3 +217,56 @@ Two extra checks help a lot:
 Rule of thumb: whenever kernel correctness depends on metadata tensors rather
 than just shapes and dtypes, autotune with real captured inputs instead of
 relying on automatic input generation.
+
+## [Question] I changed the kernel source, but rerunning the profiler did not recompile it
+
+If a profiling or autotuning rerun finishes suspiciously quickly, reuses an old
+best config, or does not print the usual compile logs after you edited the
+kernel, the usual cause is a cache hit rather than TileLang ignoring the edit.
+
+TileLang has multiple cache layers:
+
+- JIT caches compiled kernels per specialization.
+- The autotuner caches tuning results in memory and on disk.
+
+For autotuning, a subtle failure mode is that the cache key is built from the
+source of the callable you pass into the autotuner. If that callable is a small
+outer kernel factory like:
+
+```python
+def kernel(block_M=None, threads=None):
+    return make_kernel(
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        head_dim=head_dim,
+        block_M=block_M,
+        threads=threads,
+        dtype=rope_dtype,
+    )
+```
+
+then editing the internals of `make_kernel(...)` may not change the autotune
+cache key if the outer `kernel(...)` closure source stays the same. In that
+case, the autotuner can reload a previously tuned kernel and skip visible
+recompilation.
+
+Typical signs:
+
+1. The rerun completes much faster than a fresh tune.
+2. The previous best config appears immediately.
+3. You changed helper or lowering code, but not the outer autotune closure.
+
+Ways to force a fresh run:
+
+1. Set `TILELANG_AUTO_TUNING_DISABLE_CACHE=1` to disable autotune disk cache.
+2. Set `TILELANG_DISABLE_CACHE=1` to disable TileLang caches globally.
+3. Delete the relevant cache directory under `~/.tilelang/cache`.
+4. Run the direct JIT path once without autotuning to confirm the new kernel
+   itself recompiles.
+5. For debugging only, make a trivial source change inside the autotune closure
+   so its cache key changes too.
+
+Rule of thumb: if a kernel edit does not appear to trigger recompilation, check
+which callable owns the active cache key. Changing a nested helper is not always
+enough to invalidate an autotune cache entry.

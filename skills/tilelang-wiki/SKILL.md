@@ -49,6 +49,10 @@ Open `FAQs.md` early when the user reports a concrete compiler error, profiler
 surprise, autotuning failure, or an example that compiles but does not validate
 or perform as expected.
 
+Also open `FAQs.md` early when the user says they changed kernel source but a
+profile or autotune rerun did not appear to recompile. Cache behavior and cache
+keys can be the real issue even when the kernel body changed.
+
 Then open deeper files only as needed.
 
 ## Language Basics
@@ -106,6 +110,8 @@ Route by user intent, not by file tree.
 - Surface target assumptions early, especially CUDA vs HIP/AMD and Hopper/Blackwell-specific behavior.
 - Separate semantic correctness from performance tuning.
 - For debugging, use a stepwise workflow: reproduce, inspect generated artifacts, compare against a reference, then minimize.
+- For autotune or profiler surprises, explicitly consider cache reuse before
+  assuming the source edit was ignored.
 - When recommending an example, explain why it matches the user's operator, datatype, and hardware.
 
 ## Important Caveats
@@ -115,3 +121,6 @@ Route by user intent, not by file tree.
 - The local example tree is broad and evolves faster than prose docs, so prefer `examples/README.md` to choose an operator family and then open the specific example directory or README.
 - `FAQs.md` is intentionally issue-driven and may mention pitfalls not yet
   surfaced in the higher-level guides; use it for surgical debugging advice.
+- Autotune and JIT cache behavior can explain why a rerun does not visibly
+  recompile after a source edit. Do not assume the kernel body change alone
+  invalidated the active cache key; check the cache rules in the docs and FAQs.

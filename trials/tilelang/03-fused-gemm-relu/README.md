@@ -30,7 +30,7 @@ This trial implements a TileLang kernel for the operator:
 Run:
 
 ```bash
-uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/03-fused-gemm-relu/test_fused_gemm_relu_kernel.py
+uv run python test_fused_gemm_relu_kernel.py
 ```
 
 ## Profiling
@@ -38,7 +38,7 @@ uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/03-fused-gemm-relu
 Run:
 
 ```bash
-uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/03-fused-gemm-relu/profile_fused_gemm_relu_kernel.py
+uv run python profile_fused_gemm_relu_kernel.py
 ```
 
 Use `--no-autotune` to benchmark a single fixed configuration instead of searching the config space.
@@ -54,8 +54,8 @@ Use `--no-autotune` to benchmark a single fixed configuration instead of searchi
 
 The closest official examples in this workspace are:
 
-- `/home/adversarr/Repo/kernel-dsl/skills/tilelang-wiki/examples/quickstart.py`
-- `/home/adversarr/Repo/kernel-dsl/skills/tilelang-wiki/examples/gemm/example_gemm_autotune.py`
+- `../../skills/tilelang-wiki/examples/quickstart.py`
+- `../../skills/tilelang-wiki/examples/gemm/example_gemm_autotune.py`
 
 Those examples use the same core structure:
 

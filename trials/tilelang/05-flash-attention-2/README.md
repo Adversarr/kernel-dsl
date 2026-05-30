@@ -34,7 +34,7 @@ with `q`, `k`, and `v` laid out as `(batch, seq_len, heads, head_dim)`.
 Run:
 
 ```bash
-uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/05-flash-attention-2/test_flash_attention2_kernel.py
+uv run python test_flash_attention2_kernel.py
 ```
 
 Verified cases:
@@ -48,7 +48,7 @@ Verified cases:
 Run:
 
 ```bash
-uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/05-flash-attention-2/profile_flash_attention2_kernel.py
+uv run python profile_flash_attention2_kernel.py
 ```
 
 Use `--no-autotune` to benchmark a single fixed configuration instead of searching the config space.
@@ -65,12 +65,12 @@ Use `--no-autotune` to benchmark a single fixed configuration instead of searchi
 
 The closest official implementation in this workspace is:
 
-- `/home/adversarr/Repo/kernel-dsl/.agents/skills/tilelang-wiki/examples/flash_attention/example_mha_fwd_bshd.py`
+- `../../.agents/skills/tilelang-wiki/examples/flash_attention/example_mha_fwd_bshd.py`
 
 Related official validation entry points are:
 
-- `/home/adversarr/Repo/kernel-dsl/.agents/skills/tilelang-wiki/examples/flash_attention/test_example_flash_attention.py`
-- `/home/adversarr/Repo/kernel-dsl/.agents/skills/tilelang-wiki/examples/flash_attention/README.md`
+- `../../.agents/skills/tilelang-wiki/examples/flash_attention/test_example_flash_attention.py`
+- `../../.agents/skills/tilelang-wiki/examples/flash_attention/README.md`
 
 ## What This Trial Adds
 

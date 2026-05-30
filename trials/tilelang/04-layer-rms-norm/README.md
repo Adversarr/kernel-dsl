@@ -31,7 +31,7 @@ This trial implements a TileLang kernel for the operator:
 Run:
 
 ```bash
-uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/04-layer-rms-norm/test_layer_rms_norm_kernel.py
+uv run python test_layer_rms_norm_kernel.py
 ```
 
 ## Profiling
@@ -39,7 +39,7 @@ uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/04-layer-rms-norm/
 Run:
 
 ```bash
-uv run python /home/adversarr/Repo/kernel-dsl/trials/tilelang/04-layer-rms-norm/profile_layer_rms_norm_kernel.py
+uv run python profile_layer_rms_norm_kernel.py
 ```
 
 Use `--no-autotune` to benchmark a single fixed configuration.
@@ -54,7 +54,7 @@ Use `--no-autotune` to benchmark a single fixed configuration.
 
 The closest official TileLang implementation in this workspace is:
 
-- `/home/adversarr/Repo/kernel-dsl/.agents/skills/tilelang-wiki/examples/norm/rms_norm.py`
+- `../../.agents/skills/tilelang-wiki/examples/norm/rms_norm.py`
 
 That official example confirms the same core operator structure:
 

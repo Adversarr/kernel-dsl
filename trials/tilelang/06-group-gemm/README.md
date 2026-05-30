@@ -85,9 +85,9 @@ These measurements satisfy the target goals for this trial:
 After verification, the closest official TileLang implementations in this
 workspace are:
 
-- `/home/adversarr/Repo/kernel-dsl/skills/tilelang-wiki/examples/grouped_gemm/example_grouped_gemm_fwd.py`
-- `/home/adversarr/Repo/kernel-dsl/skills/tilelang-wiki/examples/grouped_gemm/example_grouped_gemm_fwd_ptr.py`
-- `/home/adversarr/Repo/kernel-dsl/skills/tilelang-wiki/examples/grouped_gemm/test_example_grouped_gemm.py`
+- `../../skills/tilelang-wiki/examples/grouped_gemm/example_grouped_gemm_fwd.py`
+- `../../skills/tilelang-wiki/examples/grouped_gemm/example_grouped_gemm_fwd_ptr.py`
+- `../../skills/tilelang-wiki/examples/grouped_gemm/test_example_grouped_gemm.py`
 
 The official examples cover a different operator shape than this trial:
 

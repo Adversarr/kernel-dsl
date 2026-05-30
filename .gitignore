@@ -5,3 +5,4 @@ tmp/
 .pytest_cache
 .venv
 .trae
+*trace.json

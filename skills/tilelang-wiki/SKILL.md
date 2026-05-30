@@ -1,0 +1,108 @@
+---
+name: "tilelang-wiki"
+description: "Answers TileLang DSL, kernel-writing, tuning, debugging, and operator questions from the bundled wiki/examples. Invoke when users ask how to write, understand, optimize, or debug TileLang kernels."
+---
+
+# TileLang Wiki
+
+Use this skill when the user needs grounded help with TileLang concepts, kernel
+authoring, optimization, debugging, operator selection, or compiler/runtime
+internals.
+
+Treat the bundled local files as the source of truth:
+
+- `references/README.md`: main TileLang reference entry point
+- `examples/README.md`: example catalogue and operator inventory
+
+Do not rely on external TileLang docs unless the user explicitly asks for
+outside information.
+
+## When To Invoke
+
+Invoke this skill when the user asks:
+
+- how to install TileLang or choose a target/backend
+- how to write or understand a TileLang kernel
+- what a TileLang construct means, such as `@tilelang.jit`, `T.Kernel`, `T.copy`, `T.gemm`, `T.Pipelined`, or memory scopes
+- for a quick API lookup, such as which allocation, loop, math, profiling, or debugging primitive to use
+- whether a Python pattern is supported inside TileLang kernels
+- how to tune, profile, or debug a TileLang kernel
+- which local example best matches an operator, datatype, hardware target, or optimization goal
+- how TileLang compiler or runtime internals behave
+
+Do not invoke this skill for unrelated CUDA, Triton, or generic TVM questions
+unless the user is clearly working through TileLang material.
+
+## Primary Sources
+
+Start with:
+
+- `references/README.md` for the compact language overview, quick API reference, kernel templates, and routing to deeper guides
+- `examples/README.md` for the example catalogue and operator-family lookup
+
+Open `references/programming_guides/language_basics.md` early when the user
+needs more detail on symbolic shapes, dtype forms, launch structure, or the
+`T.copy(...)` versus `T.async_copy(...)` distinction.
+
+Then open deeper files only as needed.
+
+## Language Basics
+
+Always keep this mental model available when answering:
+
+1. Define a kernel with `@tilelang.jit` or a nested `@T.prim_func`.
+2. Declare shapes with `T.const(...)` or `T.dynamic(...)`.
+3. Annotate buffers with `T.Tensor(...)` and outputs with `T.empty(...)`.
+4. Launch work with `T.Kernel(...)`.
+5. Allocate storage with `T.alloc_shared(...)`, `T.alloc_fragment(...)`, `T.alloc_local(...)`, or `T.alloc_var(...)`.
+6. Move tiles with `T.copy(...)`.
+7. Compute with `T.gemm(...)`, reductions, or elementwise loops.
+8. Optimize with `T.Pipelined(...)`, swizzle, autotuning, or target-specific primitives.
+9. Validate against a reference and inspect generated code or profiling output if needed.
+
+Important distinctions to explain clearly:
+
+- `T.const(...)` is for dimensions inferred from concrete input tensors
+- `T.dynamic(...)` keeps dimensions symbolic in the compiled kernel
+- `T.Parallel(...)` is the usual high-level elementwise loop
+- `T.Pipelined(...)` is the usual staged copy/compute loop
+- `T.if_then_else(...)` is for value-producing conditionals
+- `T.copy(...)` is the default movement primitive; `T.async_copy(...)` is for deliberately managed overlap
+
+If the user is new to TileLang, start from `references/README.md` and the local
+`examples/quickstart.py` pattern.
+
+## Working Style
+
+Route by user intent, not by file tree.
+
+1. Identify the goal:
+   - setup
+   - first kernel
+   - DSL semantics
+   - operator/example selection
+   - optimization
+   - debugging
+   - internals
+2. Open `references/README.md` first for the compact overview, quick API table, and template shape.
+3. Open `references/programming_guides/language_basics.md` next for detailed DSL semantics or symbolic-shape questions.
+4. Open `examples/README.md` when the user needs a matching runnable example.
+5. Use deeper pages under `references/` only for exact semantics, caveats, or internals.
+6. Prefer the simplest correct example before advanced architecture-specific variants.
+
+## Answering Rules
+
+- Prefer practical guidance over file dumps.
+- Use `references/README.md` for conceptual explanation and `examples/README.md` for locating the right example family.
+- Use `references/README.md` for fast API lookup, then `references/programming_guides/language_basics.md` when the answer needs more nuance than the compact tables provide.
+- If docs and examples overlap, use docs for semantics and examples for implementation patterns.
+- Surface target assumptions early, especially CUDA vs HIP/AMD and Hopper/Blackwell-specific behavior.
+- Separate semantic correctness from performance tuning.
+- For debugging, use a stepwise workflow: reproduce, inspect generated artifacts, compare against a reference, then minimize.
+- When recommending an example, explain why it matches the user's operator, datatype, and hardware.
+
+## Important Caveats
+
+- Some deeper reference pages are more detailed than the top-level overview; follow `references/README.md` links when the top-level summary is not enough.
+- Some useful pages are not part of the original top-level toctree, especially `references/programming_guides/cluster_tma.md` and `references/runtime_internals/stubs.md`; still use them when relevant.
+- The local example tree is broad and evolves faster than prose docs, so prefer `examples/README.md` to choose an operator family and then open the specific example directory or README.

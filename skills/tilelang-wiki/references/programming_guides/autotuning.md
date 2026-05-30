@@ -1,308 +1,522 @@
 # Autotuning
 
-TileLang includes a built‑in autotuner that searches configuration spaces
-for the best performing kernel, compiles candidates in parallel, validates
-correctness, benchmarks them, and caches the best result for reuse.
+TileLang's autotuner searches a list of configuration dictionaries, compiles
+each candidate, optionally validates the result, benchmarks candidates, and
+returns the fastest compiled kernel.
 
-This guide covers two workflows:
-- Decorator‑based: `@tilelang.autotune(configs=...)` stacked on `@tilelang.jit`
-- Programmatic: `AutoTuner.from_kernel(...).set_*().run()`
+There are two supported workflows:
+- Decorator workflow: `@tilelang.autotune(...)` stacked above `@tilelang.jit(...)`
+- Programmatic workflow: `AutoTuner.from_kernel(...).set_*().run(...)`
 
-It also explains input tensor supply, validation, caching, and environment
-variables that affect parallelism and cache behavior.
+This guide assumes you already know the surrounding kernel structure from
+`language_basics.md`. It focuses on how tunable parameters, config lists,
+validation, and benchmarking wrap that kernel shape.
 
-## 1) Decorator‑based Autotune
+Implementation anchors:
+- `import tilelang.autotuner.tuner`
+- `import tilelang.autotuner.param`
+- `import tilelang.autotuner.capture`
+- `import tilelang.env`
 
-Use `@tilelang.autotune` above `@tilelang.jit` and expose tunable parameters as
-function arguments with defaults. The autotuner overrides these parameters with
-values from your config space.
+Example anchors:
+- `examples/gemm/example_gemm_autotune.py`
+- `examples/gemm/example_gemm_advanced_autotune.py`
+- `examples/gdn/example_chunk_delta_h.py`
+- `examples/flash_attention/example_mha_fwd_bshd.py`
+
+## What a Config Is
+
+A config is a dictionary whose keys match tunable arguments in the kernel
+factory:
 
 ```python
-import tilelang
-import tilelang.language as T
+configs = [
+    {
+        "block_M": 128,
+        "block_N": 256,
+        "block_K": 32,
+        "num_stages": 2,
+        "thread_num": 128,
+        "enable_rasteration": True,
+    },
+]
+```
 
-def matmul_configs(M, N, K):
-    # Example space — tailor to your target
-    tiles = [64, 128]
-    stages = [2, 3]
-    threads = [128, 256]
+During tuning, TileLang calls the factory once per config by passing those keys
+as keyword arguments. If a config contains a key that is not a parameter of the
+factory, `AutoTuner.run()` raises `ValueError("Unused keys in config: ...")`.
+
+Tune compile-time scheduling parameters, not runtime data:
+- tile sizes: `block_M`, `block_N`, `block_K`
+- pipeline depth: `num_stages`
+- block threads: `threads` or `thread_num`
+- memory/layout knobs: swizzle enable flags, GEMM transpose choices, split-K
+  factors, backend-specific staging choices
+
+## Decorator Workflow
+
+The decorator must be written above `@tilelang.jit` because Python applies
+decorators from bottom to top, and `tilelang.autotune` expects to receive a
+`JITImpl`.
+
+```python
+import itertools
+import tilelang
+
+
+def get_configs():
+    iter_params = dict(
+        block_M=[64, 128],
+        block_N=[64, 128],
+        block_K=[32, 64],
+        num_stages=[0, 1, 2, 3],
+        thread_num=[128, 256],
+        enable_rasterization=[False, True],
+    )
     return [
-        dict(block_M=BM, block_N=BN, block_K=BK, num_stages=S, threads=TH)
-        for BM in tiles
-        for BN in tiles
-        for BK in [32, 64]
-        for S in stages
-        for TH in threads
+        dict(zip(iter_params.keys(), values))
+        for values in itertools.product(*iter_params.values())
     ]
 
-@tilelang.autotune(configs=matmul_configs, warmup=25, rep=100, timeout=60)
+
+@tilelang.autotune(configs=get_configs(), warmup=3, rep=20)
 @tilelang.jit(out_idx=[-1])
-def matmul(M: int, N: int, K: int,
-           block_M: int = 128, block_N: int = 128, block_K: int = 32,
-           threads: int = 128, num_stages: int = 3,
-           dtype: str = 'float16', accum_dtype: str = 'float32'):
-
-    @T.prim_func
-    def kernel(A: T.Tensor((M, K), dtype),
-               B: T.Tensor((K, N), dtype),
-               C: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_s = T.alloc_shared((block_M, block_K), dtype)
-            B_s = T.alloc_shared((block_K, block_N), dtype)
-            C_f = T.alloc_fragment((block_M, block_N), accum_dtype)
-            T.clear(C_f)
-
-            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                T.copy(A[by * block_M, ko * block_K], A_s)
-                T.copy(B[ko * block_K, bx * block_N], B_s)
-                T.gemm(A_s, B_s, C_f)
-
-            T.copy(C_f, C[by * block_M, bx * block_N])
-
-    return kernel
-
-# Usage
-# Provide inputs via context (recommended for reproducibility across configs)
-import torch
-M = N = K = 1024
-A = torch.randn(M, K, device='cuda', dtype=torch.float16)
-B = torch.randn(K, N, device='cuda', dtype=torch.float16)
-C = torch.empty(M, N, device='cuda', dtype=torch.float16)
-
-from tilelang.autotuner import set_autotune_inputs
-with set_autotune_inputs(A, B, C):
-    tuned_kernel = matmul(M, N, K)   # compiles, tunes, returns best kernel
-    tuned_kernel(A, B, C)            # run best kernel
+def matmul(M, N, K,
+           block_M=128,
+           block_N=128,
+           block_K=32,
+           num_stages=2,
+           thread_num=128,
+           enable_rasterization=False):
+    # Build the usual TileLang kernel here.
+    # The kernel body is the same minimal structure shown in
+    # `language_basics.md`, except the tuning parameters now drive
+    # tile sizes, thread count, swizzle choice, and pipeline depth.
+    ...
 ```
 
-Notes
-- `configs` can be a list of dicts or a callable `(args...) -> list[dict]`. Each
-  dict’s keys must match the tunable function arguments (e.g., `block_M`).
-- The decorator returns a callable that runs autotune once per argument tuple
-  and caches the resulting best kernel in‑process.
-- For explicit input control during tuning, wrap the call with
-  `set_autotune_inputs(...)`. Otherwise, `supply_type` (below) is used.
-
-## 2) Programmatic Autotune
-
-Use the `AutoTuner` class to manage configs and arguments more explicitly.
+Call the function with problem sizes. The first call for a cache key tunes and
+returns the best compiled kernel; later calls reuse the cached best kernel.
 
 ```python
+kernel = matmul(1024, 1024, 1024)
+c = kernel(a, b)
+```
+
+Use concrete tuning inputs when automatic input generation cannot infer them,
+especially with symbolic dimensions or scalar kernel inputs:
+
+```python
+from tilelang.autotuner import set_autotune_inputs
+
+with set_autotune_inputs(a, b):
+    kernel = matmul(M, N, K)
+```
+
+`set_autotune_inputs` accepts either varargs or a single list/tuple:
+
+```python
+with set_autotune_inputs(a, b):
+    ...
+
+with set_autotune_inputs([a, b]):
+    ...
+```
+
+### Decorator Arguments
+
+```python
+@tilelang.autotune(
+    configs=...,
+    warmup=25,
+    rep=100,
+    timeout=100,
+    supply_type=tilelang.TensorSupplyType.Auto,
+    ref_prog=None,
+    supply_prog=None,
+    rtol=1e-2,
+    atol=1e-2,
+    max_mismatched_ratio=0.01,
+    skip_check=False,
+    manual_check_prog=None,
+    cache_input_tensors=False,
+    do_not_specialize=None,
+)
+```
+
+Notes from the implementation:
+- Bare `@tilelang.autotune` without arguments is not supported.
+- `configs` can be a list or a callable. In decorator mode, callable configs are
+  called with the kernel factory's non-tuning arguments.
+- `do_not_specialize` excludes selected call arguments from the decorator's
+  in-process tune-cache key. This is useful when changing a value should not
+  trigger retuning.
+- If the caller explicitly provides all tunable parameters, the autotuner logs a
+  warning and uses direct JIT compilation instead of tuning.
+
+## Programmatic Workflow
+
+The programmatic API gives explicit control over compile arguments, profile
+arguments, and advanced `run()` options. The GEMM autotune example uses this
+form.
+
+```python
+import tilelang as tl
 from tilelang.autotuner import AutoTuner
 
-kernel_factory = matmul  # the function above (already @tilelang.jit)
-tuner = AutoTuner.from_kernel(kernel_factory(M, N, K), configs=matmul_configs(M, N, K))
 
-tuner.set_profile_args(
-    warmup=25, rep=100, timeout=60,
-    supply_type=tilelang.TensorSupplyType.Auto,  # or provide supply_prog/ref_prog
-    ref_prog=lambda A, B, C: torch.allclose(C, (A @ B).to(C.dtype), rtol=1e-2, atol=1e-2),
-)
+def ref_program(A, B):
+    return A @ B.T
 
-tuner.set_compile_args(
-    target='auto',                  # or 'cuda'/'hip'/'metal'
-    execution_backend='auto',       # resolves per-target
-    out_idx=[-1],                   # which outputs to return if multiple
-    pass_configs={                  # optional TVM passes/flags
-        # tilelang.PassConfigKey.EXAMPLE_KEY: value,
-    },
-)
 
-artifact = tuner.run()             # compiles + runs + validates all configs
-best_kernel = artifact.kernel      # JITKernel
-best_latency = artifact.latency
-best_config = artifact.config
+def get_best_config(M, N, K, profile_backend="event"):
+    def kernel(block_M=None,
+               block_N=None,
+               block_K=None,
+               num_stages=None,
+               thread_num=None,
+               enable_rasteration=None):
+        # Return the usual TileLang kernel factory here.
+        ...
 
-# Reuse best kernel
-best_kernel(A, B, C)
+    autotuner = (
+        AutoTuner.from_kernel(kernel=kernel, configs=get_configs(M, N, K))
+        .set_compile_args(out_idx=[-1], target="auto")
+        .set_profile_args(
+            supply_type=tl.TensorSupplyType.Integer,
+            ref_prog=ref_program,
+            skip_check=False,
+            backend=profile_backend,
+        )
+    )
+
+    return autotuner.run(warmup=3, rep=20)
 ```
 
-### Example Gallery (in repo)
-- examples/gdn/example_chunk_delta_h.py:101 — uses `@autotune` to sweep configs
-- examples/deepseek_nsa/benchmark/benchmark_nsa_fwd.py:451 — uses `@tilelang.autotune`
-- examples/quickstart.py:84 — profiles a tuned kernel with `get_profiler`
-- examples/hadamard_transform/example_hadamard.py:152 — profiler with custom warmup
-- examples/dynamic_shape/example_dynamic.py:94 — profiler for dynamic shapes
-- examples/gemm/example_gemm_persistent.py:135 — compare persistent vs non‑persistent
+`AutoTuner.run()` returns an `AutotuneResult`:
 
-Click any path to open the code and compare patterns.
-
-## Input Tensor Supply
-
-The tuner needs inputs to compile and benchmark kernels. Provide them in one of
-three ways (priority order):
-
-1) Context manager (fixed inputs across configs)
 ```python
-with set_autotune_inputs(A, B, C):
-    tuned = matmul(M, N, K)
+result = get_best_config(M, N, K)
+print(result.config)
+print(result.latency)
+kernel = result.kernel
 ```
 
-2) Custom supplier program
+For the underlying kernel ingredients referenced here, see:
+
+- `language_basics.md` for the canonical tiled kernel skeleton.
+- `software_pipeline.md` for `num_stages` and `T.Pipelined`.
+- `instructions.md` for `T.copy`, `T.gemm`, and `T.use_swizzle`.
+
+### Compile Arguments
+
 ```python
-def supply_prog(signature):
-    # signature holds KernelParam objects describing shapes/dtypes
-    # Return a list of torch tensors matching the kernel’s arguments
-    return [A, B, C]
-
-tuner.set_profile_args(supply_prog=supply_prog)
+autotuner.set_compile_args(
+    out_idx=[-1],
+    target="auto",
+    execution_backend="auto",
+    target_host=None,
+    verbose=False,
+    pass_configs=None,
+)
 ```
 
-3) Built‑in generators via `supply_type`
-- `TensorSupplyType.Auto` (default): heuristic per dtype (uniform ints / fp ranges)
-- `Integer`, `Uniform`, `Normal`, `Randn`, `Zero`, `One`
+If `target`, `execution_backend`, or `verbose` are omitted, TileLang reads the
+environment-backed defaults:
+- `TILELANG_TARGET`
+- `TILELANG_EXECUTION_BACKEND`
+- `TILELANG_VERBOSE`
 
-Important
-- Built‑in generators require static shapes; if your PrimFunc uses symbolic
-  dimensions (T.dyn), supply concrete inputs via (1) or (2).
-- Float8 dtypes require PyTorch 2.1+ for `torch.float8_*` support.
+`target` is normalized through `determine_target(...)` and then wrapped as a TVM
+`Target`. The execution backend is resolved against that target.
 
-## Correctness Checking and Tolerances
+Supported execution backend strings in the compile args are:
+- `"auto"`
+- `"tvm_ffi"`
+- `"cython"`
+- `"nvrtc"`
+- `"torch"`
 
-Use one of the following validation methods:
-- `ref_prog`: Provide a reference program that receives the same inputs and
-  checks results. You can return a boolean or raise on mismatch.
-- `manual_check_prog`: A callable that inspects outputs and raises on mismatch.
-- `skip_check=True`: Skip correctness checks (faster, use with caution).
+Some backend-specific code also handles CuTeDSL artifacts, but the public
+compile-argument type currently exposes the strings above.
 
-Control numeric drift via:
-- `rtol` and `atol` (defaults 1e‑2)
-- `max_mismatched_ratio` (default 1%)
+### Profile Arguments
 
-## Configuration Spaces and Best Practices
+```python
+autotuner.set_profile_args(
+    warmup=25,
+    rep=100,
+    timeout=30,
+    supply_type=tilelang.TensorSupplyType.Auto,
+    ref_prog=None,
+    supply_prog=None,
+    rtol=1e-2,
+    atol=1e-2,
+    max_mismatched_ratio=0.01,
+    skip_check=False,
+    manual_check_prog=None,
+    cache_input_tensors=False,
+    backend="event",
+)
+```
 
-What to tune
-- Tile sizes: `block_M`, `block_N`, `block_K`
-- Software pipelining: `num_stages`
-- Threads per block: `threads` (or (x, y) tuple)
-- Optional: dtype variants, epilogues, small scheduling knobs
+For the programmatic API, pass timing controls to `autotuner.run(...)`. The
+`warmup`, `rep`, and `timeout` values stored in `ProfileArgs` participate in the
+profile-argument object and cache hashing, but the active benchmark loop receives
+the `warmup`, `rep`, and `timeout` arguments from `run()`.
 
-Tips
-- Start from a working baseline. Tune a small, meaningful space first.
-- Respect hardware limits (shared memory bytes, registers per thread/block,
-  max threads per block). Eliminate impossible configs up‑front.
-- Keep block sizes multiples of vector widths and warp sizes when relevant.
-- Use `set_autotune_inputs` to ensure each config is measured on identical data.
-- Record your best configs and bake them as defaults when stable.
+Profiler backends are:
+- `"event"`
+- `"cupti"`
+- `"cudagraph"`
 
-## Parallel Compilation/Benchmarking and Timeouts
+Validation behavior:
+- If `skip_check=False` and `ref_prog` is provided, the profiler validates the
+  candidate against `ref_prog`.
+- If `manual_check_prog` is also provided, TileLang calls
+  `manual_assert_close(...)`.
+- Otherwise it calls `assert_allclose(...)` with `rtol`, `atol`, and
+  `max_mismatched_ratio`.
+- If `ref_prog` is `None`, the autotuner benchmarks candidates without a
+  correctness reference.
+- `ref_prog` should return reference output tensors. Do not return a boolean
+  from `ref_prog`; use `manual_check_prog` for custom boolean/assertion logic.
 
-The tuner compiles configurations in parallel using a thread pool and benchmarks
-them with a per‑config timeout. On CUDA, each worker sets the current device to
-avoid context issues.
+## Input Supply
 
-Notes
-- `timeout` uses POSIX signals; on non‑Unix systems, it may not take effect.
-- Logs are written to `autotuner.log` in the working directory.
+The autotuner needs concrete tensors to benchmark each candidate. Use the
+following priority order.
+
+### 1. `set_autotune_inputs`
+
+This is the most predictable path for real kernels and is required when a
+non-output PrimFunc parameter is scalar rather than a buffer.
+
+```python
+with set_autotune_inputs(a, b):
+    kernel = matmul(M, N, K)
+```
+
+In `set_profile_args`, TileLang freezes captured inputs immediately and builds a
+device-aware `supply_prog`. If benchmarking uses multiple CUDA devices, captured
+tensors are cloned to the worker device.
+
+### 2. Custom `supply_prog`
+
+`supply_prog` receives profiler parameters and returns input tensors:
+
+```python
+def supply_prog(params):
+    # params is a list of KernelParam-like descriptors for the current candidate.
+    return [a, b]
+
+autotuner.set_profile_args(supply_prog=supply_prog)
+```
+
+If `set_autotune_inputs(...)` is active, TileLang warns that `supply_prog` is
+ignored. If `supply_prog` is provided, `supply_type` is ignored.
+
+### 3. Built-in Tensor Suppliers
+
+Without captured inputs or a custom supplier, TileLang uses the kernel profiler's
+input generation:
+
+```python
+autotuner.set_profile_args(supply_type=tl.TensorSupplyType.Integer)
+```
+
+Common values used by examples:
+- `tl.TensorSupplyType.Auto`
+- `tl.TensorSupplyType.Integer`
+- `tl.TensorSupplyType.Normal`
+- `tl.TensorSupplyType.Randn`
+
+Automatic input generation is convenient for static tensor-only kernels. For
+symbolic shapes, dynamic values, scalar inputs, or unusual dtype requirements,
+provide explicit inputs.
 
 ## Caching
 
-The autotuner caches best artifacts both in‑memory (per process) and on disk under
-`$TILELANG_CACHE_DIR/autotuner`. The cache key includes:
-- TileLang version, function source, closure free‑vars
-- Config list, compile args, profile args
+TileLang caches autotune results in memory and on disk when caching is enabled.
+The cache key includes:
+- TileLang version
+- function source
+- default parameter values
+- selected closure values
+- kernel call parameters
+- config list
+- compile-argument hash
+- profile-argument hash
 
-Disk cache contents (per key)
-- Best config and latency: `best_config.json`, `latency.json`
-- Kernel sources and library: `device_kernel.cu`, `host_kernel.cu`, `kernel_lib.so` (or `kernel.cubin`/`executable.so` depending on backend)
-- Function and params: `function.pkl`, `params.pkl`
+Disk cache directory:
 
-Control via env vars (tilelang.env)
-- `TILELANG_CACHE_DIR` (default `~/.tilelang/cache`)
-- `TILELANG_TMP_DIR` (default `$TILELANG_CACHE_DIR/tmp`)
-- Disable all kernel caches: `TILELANG_DISABLE_CACHE=1`
-- Disable autotune disk cache only: `TILELANG_AUTO_TUNING_DISABLE_CACHE=1`
-
-CPU worker control
-- `TILELANG_AUTO_TUNING_CPU_UTILITIES` (fraction, default 0.9)
-- `TILELANG_AUTO_TUNING_CPU_COUNTS` (int, `-1` auto)
-- `TILELANG_AUTO_TUNING_MAX_CPU_COUNT` (int, `-1` unlimited)
-
-Backend notes
-- NVRTC backend persists `.cubin` and a Python launcher.
-- Torch/DLPack backend may not save artifacts to disk; in this case, only
-  in‑memory caching applies and a warning is logged.
-
-## Alternative: Manual Sweeps with par_compile
-
-If you prefer manual control, use `JITImpl.par_compile` to compile a batch of
-configs and drive your own benchmarking:
-
-```python
-@tilelang.jit
-def factory(M, N, K, block_M=128, block_N=128, block_K=32):
-    @T.prim_func
-    def k(A: T.Tensor((M, K), 'float16'),
-           B: T.Tensor((K, N), 'float16'),
-           C: T.Tensor((M, N), 'float16')):
-        ...
-    return k
-
-impl = factory  # JITImpl
-cfgs = [
-    dict(block_M=64, block_N=128, block_K=32),
-    dict(block_M=128, block_N=128, block_K=64),
-]
-kernels = impl.par_compile(cfgs, num_workers=4)
-# Now benchmark kernels[i](A, B, C) yourself
+```text
+<TileLang kernel cache namespace>/autotuner/<cache-key>/
 ```
 
-## Recording and Reusing Best Configs
+The namespace root is derived from the kernel cache, which is controlled by
+`TILELANG_CACHE_DIR`.
 
-The programmatic path returns an `AutotuneResult` that can be saved and later
-reloaded. This is useful for CI, multi‑host workflows, or shipping tuned configs.
+Files written by `AutotuneResult.save_to_disk(...)` include:
+- `best_config.json`
+- `latency.json`
+- `function.pkl`
+- `out_idx.json`
+- `params.pkl`
+- `device_kernel.cu`
+- `host_kernel.cu`
+- one backend artifact such as `kernel_lib.so`, `kernel.cubin`, `kernel.py`, or
+  `executable.so`
+
+Cache controls:
+- `TILELANG_CACHE_DIR`: default `~/.tilelang/cache`
+- `TILELANG_TMP_DIR`: default `$TILELANG_CACHE_DIR/tmp`
+- `TILELANG_DISABLE_CACHE=1`: disable TileLang caches globally
+- `TILELANG_AUTO_TUNING_DISABLE_CACHE=1`: disable autotune disk cache
+
+The `"torch"` execution backend logs that disk cache saving is not supported for
+that path. In that case, rely on in-process reuse or use a backend that persists
+artifacts.
+
+## Parallelism and Advanced Run Options
+
+Basic run:
 
 ```python
-artifact = tuner.run()  # AutotuneResult
+result = autotuner.run(warmup=3, rep=20, timeout=100)
+```
 
-# Save to disk
+Advanced run, as used by `example_gemm_advanced_autotune.py`:
+
+```python
+result = autotuner.run(
+    warmup=warmup,
+    rep=rep,
+    timeout=timeout,
+    use_pipeline=use_pipeline,
+    enable_grouped_compile=enable_grouped_compile,
+    group_compile_size=group_compile_size,
+    benchmark_multi_gpu=benchmark_multi_gpu,
+    benchmark_devices=benchmark_devices,
+)
+```
+
+Compile workers use a `ThreadPoolExecutor`. Worker count is controlled by:
+- `TILELANG_AUTO_TUNING_CPU_UTILITIES`: CPU fraction, default `0.9`
+- `TILELANG_AUTO_TUNING_CPU_COUNTS`: explicit worker count, `-1` means auto
+- `TILELANG_AUTO_TUNING_MAX_CPU_COUNT`: cap, `-1` means no cap
+
+Grouped compile:
+- Enabled by `enable_grouped_compile=True` and `group_compile_size > 1`.
+- Currently active only for CUDA plus `tvm_ffi`.
+- Other target/backend combinations fall back to per-config compilation with a
+  warning.
+
+Pipelined benchmark:
+- `use_pipeline=True` lets benchmark workers start as soon as compiled
+  candidates become available.
+- `use_pipeline=False` waits until compile progress reaches the benchmark phase.
+
+Multi-GPU benchmark:
+- `benchmark_multi_gpu=True` distributes benchmark work across CUDA device
+  ordinals.
+- `benchmark_devices=[0, 1, ...]` restricts the device list.
+- Non-CUDA targets or invalid devices fall back to a single current device with
+  warnings.
+
+Timeouts:
+- `timeout > 0` applies per benchmark call.
+- In the active autotuner benchmark path, worker threads run each benchmark call
+  in a daemon sub-thread and join with the configured timeout.
+- A POSIX `SIGALRM` helper exists in the module, but the threaded benchmark path
+  is the path used by `AutoTuner.run()`.
+
+Logs are written to `autotuner.log` in the current working directory.
+
+## Saving and Loading Results
+
+`AutotuneResult` can be saved manually:
+
+```python
 from pathlib import Path
-save_dir = Path('out/best/matmul_1024')
-artifact.save_to_disk(save_dir, verbose=True)
 
-# Reload later
-from tilelang.autotuner.param import AutotuneResult, CompileArgs
-restored = AutotuneResult.load_from_disk(save_dir, CompileArgs())
-best = restored.kernel
-best(A, B, C)
+result = autotuner.run(warmup=3, rep=20)
+result.save_to_disk(Path("out/best/matmul_1024"), verbose=True)
 ```
 
-Notes
-- DLPack/Torch execution backend may not persist compiled binaries; in that
-  case, re‑compilation is needed on load or use a different backend.
-- The directory contains human‑readable JSONs (best config/latency) and sources.
-
-## Advanced: Config Space Callables
-
-Derive config spaces from problem sizes to keep searches targeted and legal:
+Reload with matching compile arguments:
 
 ```python
-def matmul_configs(M, N, K):
-    large = min(M, N, K) >= 1024
-    tiles = [128] if large else [64, 128]
-    for BM in tiles:
-        for BN in tiles:
-            for BK in [32, 64]:
-                for S in [2, 3]:
-                    for TH in [128, 256]:
-                        yield dict(block_M=BM, block_N=BN, block_K=BK,
-                                    num_stages=S, threads=TH)
+from tilelang.autotuner.param import AutotuneResult, CompileArgs
+
+restored = AutotuneResult.load_from_disk(
+    "out/best/matmul_1024",
+    CompileArgs(out_idx=[-1], target="auto", execution_backend="auto"),
+)
+kernel = restored.kernel
 ```
 
-## Device and Backend Selection
+For backend paths that do not persist executable artifacts, reloading may return
+no kernel and require recompilation.
 
-Tune compile‑time options explicitly:
-- `target='auto'|'cuda'|'hip'|'metal'` (normalized to a TVM Target)
-- `execution_backend='auto'|'tvm_ffi'|'cython'|'nvrtc'|'torch'`
-- `pass_configs={...}` to toggle TileLang/TVM passes for experiments
+## Config Space Guidance
 
-On CUDA with multiple GPUs, the tuner sets the current device per worker thread
-to avoid context mixups.
+Keep config spaces legal and small at first:
+
+```python
+def get_configs(M, N, K):
+    block_M = [64, 128, 256]
+    block_N = [64, 128, 256]
+    block_K = [32, 64]
+    num_stages = [0, 1, 2, 3]
+    thread_num = [128, 256]
+    enable_rasterization = [True, False]
+
+    configs = []
+    for BM in block_M:
+        for BN in block_N:
+            for BK in block_K:
+                for stages in num_stages:
+                    for threads in thread_num:
+                        for swizzle in enable_rasterization:
+                            configs.append({
+                                "block_M": BM,
+                                "block_N": BN,
+                                "block_K": BK,
+                                "num_stages": stages,
+                                "thread_num": threads,
+                                "enable_rasterization": swizzle,
+                            })
+    return configs
+```
+
+Filter impossible configs before tuning:
+- shared-memory use must fit the target
+- threads must fit the target block limit
+- tile shapes must be compatible with the data layout and GEMM transpose flags
+- pipeline stages should match the copy/computation structure
+- output shape and `out_idx` must match the PrimFunc parameters
+
+For GEMM, the examples also show a Roller-backed path through
+`MatmulTemplate(...).recommend_hints(topk=...)`; use that when you want
+device-aware candidate generation instead of a raw Cartesian product.
 
 ## Troubleshooting
-- “No configurations to tune”: Ensure `configs` is a non‑empty list or callable.
-- Timeouts: Increase `timeout`; ensure inputs fit device memory; verify that
-  your reference check isn’t the bottleneck.
-- Dynamic shapes: Provide concrete inputs via `set_autotune_inputs` or a custom
-  `supply_prog`.
-- Disk cache disabled: Check `TILELANG_AUTO_TUNING_DISABLE_CACHE` and backend.
+
+- `Use tilelang.autotune to decorate func without arguments is not supported yet`:
+  call it as `@tilelang.autotune(configs=...)`.
+- `The @autotune decorator can only be applied to @tilelang.jit decorated instances`:
+  put `@tilelang.autotune(...)` above `@tilelang.jit(...)`.
+- `Unused keys in config`: remove keys that are not parameters of the kernel
+  factory or rename the factory parameter.
+- `No configurations to tune`: return a non-empty config list.
+- Scalar input error mentioning `set_autotune_inputs`: provide concrete inputs
+  with `with set_autotune_inputs(...)`.
+- Validation is slow or failing: verify `ref_prog` receives the same logical
+  inputs as the kernel and returns outputs in the shape/dtype expected by the
+  profiler.
+- Cached inputs have incompatible shape or dtype across configs: set
+  `cache_input_tensors=False` or provide a `supply_prog` that regenerates inputs
+  per candidate.
+- Disk cache does not appear: check `TILELANG_DISABLE_CACHE`,
+  `TILELANG_AUTO_TUNING_DISABLE_CACHE`, and the selected execution backend.

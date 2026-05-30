@@ -1,8 +1,6 @@
 # General Matrix-Matrix Multiplication with Tile Library
 
-<div style="text-align: left;">
-    <em>Author:</em> <a href="https://github.com/LeiWang1999">Lei Wang</a>
-</div>
+*Author: [Lei Wang](https://github.com/LeiWang1999)*
 
 :::{warning}
 :class: myclass1 myclass2
@@ -20,13 +18,9 @@ TileLang is a domain-specific language (DSL) designed for writing high-performan
 
 - **Level 3:** A user takes full control of thread-level primitives and can write code that is almost as explicit as a hand-written CUDA/HIP kernel. This is useful for performance experts who need to manage every detail, such as PTX inline assembly, explicit thread behavior, etc.
 
-```{figure} ../_static/img/overview.png
-:width: 50%
-:alt: Overview
-:align: center
-
-Figure 1: High-level overview of the TileLang compilation flow.
-```
+Figure 1 from the original blog post is omitted here because the `_static` asset
+path is not part of this self-contained skill package. For the maintained
+high-level compiler walk-through, see [Programming Guides Overview](../programming_guides/overview.md).
 
 In this tutorial, we introduce Level 2 with a matrix multiplication example in TileLang. We will walk through how to allocate shared memory, set up thread blocks, perform parallel copying, pipeline the computation, and invoke the tile-level GEMM intrinsic. We will then show how to compile and run the kernel in Python, comparing results and measuring performance.
 
@@ -42,11 +36,8 @@ While Level 1 in TileLang can be very comfortable for general users—since it r
 
 ## Matrix Multiplication Example
 
-```{figure} ../_static/img/MatmulExample.png
-:alt: Matmul Example
-:align: center
-
-```
+The original illustrative figure is omitted here because the referenced `_static`
+asset is not shipped with this skill package.
 
 ### Basic Structure
 
@@ -62,76 +53,50 @@ Below is a simplified code snippet for a 1024 x 1024 x 1024 matrix multiplicatio
 ```python
 import tilelang
 import tilelang.language as T
-from tilelang.cuda.intrinsics import make_mma_swizzle_layout
 
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-    @T.prim_func
-    def main(
-        A: T.Tensor((M, K), dtype),
-        B: T.Tensor((K, N), dtype),
-        C: T.Tensor((M, N), dtype),
-    ):
-        # Initialize Kernel Context
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), dtype)
-            B_shared = T.alloc_shared((block_K, block_N), dtype)
-            C_local  = T.alloc_fragment((block_M, block_N), accum_dtype)
 
-            # Optional layout hints (commented out by default)
-            # T.annotate_layout({
-            #     A_shared: make_mma_swizzle_layout(A_shared),
-            #     B_shared: make_mma_swizzle_layout(B_shared),
-            # })
+@tilelang.jit
+def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    M, N, K = T.const("M, N, K")
 
-            # Optional: Enabling swizzle-based rasterization
-            # T.use_swizzle(panel_size=10, enable=True)
+    A: T.Tensor((M, K), dtype)
+    B: T.Tensor((K, N), dtype)
+    C = T.empty((M, N), dtype)
 
-            # Clear local accumulation
-            T.clear(C_local)
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        A_shared = T.alloc_shared((block_M, block_K), dtype)
+        B_shared = T.alloc_shared((block_K, block_N), dtype)
+        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
-            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                # Copy tile of A from global to shared memory
-                T.copy(A[by * block_M, ko * block_K], A_shared)
+        T.clear(C_local)
+        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+            T.copy(A[by * block_M, k * block_K], A_shared)
+            T.copy(B[k * block_K, bx * block_N], B_shared)
+            T.gemm(A_shared, B_shared, C_local)
 
-                # Parallel copy tile of B from global to shared memory
-                for k, j in T.Parallel(block_K, block_N):
-                    B_shared[k, j] = B[ko * block_K + k, bx * block_N + j]
+        T.copy(C_local, C[by * block_M, bx * block_N])
 
-                # Perform a tile-level GEMM
-                T.gemm(A_shared, B_shared, C_local)
+    return C
 
-            # Copy result from local (register fragment) to global memory
-            T.copy(C_local, C[by * block_M, bx * block_N])
 
-    return main
-
-# 1. Create the TileLang function
-func = matmul(1024, 1024, 1024, 128, 128, 32)
-
-# 2. JIT-compile the kernel for NVIDIA GPU
-jit_kernel = tilelang.compile(func, out_idx=[2], target="cuda")
+kernel = matmul.compile(M=1024, N=1024, K=1024, block_M=128, block_N=128, block_K=32)
 
 import torch
 
-# 3. Prepare input tensors in PyTorch
-a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
-b = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+a = torch.randn(1024, 1024).cuda().half()
+b = torch.randn(1024, 1024).cuda().half()
 
-# 4. Invoke the JIT-compiled kernel
-c = jit_kernel(a, b)
+c = kernel(a, b)
 ref_c = a @ b
 
-# 5. Validate correctness
 torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 print("Kernel output matches PyTorch reference.")
 
-# 6. Inspect generated CUDA code (optional)
-cuda_source = jit_kernel.get_kernel_source()
+cuda_source = kernel.get_kernel_source()
 print("Generated CUDA kernel:\n", cuda_source)
 
-# 7. Profile performance
-profiler = jit_kernel.get_profiler()
-latency = profiler.do_bench()
+profiler = kernel.get_profiler()
+latency = profiler.do_bench(backend="cupti")
 print(f"Latency: {latency} ms")
 ```
 
@@ -147,11 +112,9 @@ with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx,
 - This sets up the block grid dimensions based on N/block_N and M/block_M.
 - `threads=128` specifies that each thread block uses 128 threads. The compiler will infer how loops map to these threads.
 
-```{figure} ../_static/img/Parallel.png
-:alt: Parallel
-:align: center
-
-```
+The original parallel-mapping figure is omitted here because the `_static` asset
+is not included in this skill package. For the maintained explanation of launch
+regions and thread mapping, see [Language Basics](../programming_guides/language_basics.md).
 
 2. **Shared & Fragment Memory**:
 
@@ -174,11 +137,9 @@ for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
 - `T.Pipelined` automatically arranges asynchronous copy and compute instructions to overlap memory operations with arithmetic.
 - The argument `num_stages=3` indicates the pipeline depth.
 
-```{figure} ../_static/img/software_pipeline_inference.png
-:alt: Software Pipeline Inference
-:align: center
-
-```
+The original software-pipeline figure is omitted here because the `_static`
+asset is not included in this skill package. For the maintained explanation of
+`T.Pipelined`, see [Software Pipeline](../programming_guides/software_pipeline.md).
 
 4. **Parallel Copy**:
 
@@ -217,11 +178,8 @@ TileLang Level 2 is conceptually similar to Triton in that the user can control 
 
 ## Performance on Different Platforms
 
-```{figure} ../_static/img/op_benchmark_consistent_gemm_fp16.png
-:alt: Performance on Different Platforms
-:align: center
-
-```
+The original benchmark figure is omitted here because the `_static` asset is
+not included in this skill package.
 
 When appropriately tuned (e.g., by using an auto-tuner), TileLang achieves performance comparable to or better than vendor libraries and Triton on various GPUs. In internal benchmarks, for an FP16 matrix multiply (e.g., 4090, A100, H100, MI300X), TileLang has shown:
 
@@ -249,6 +207,10 @@ For more advanced usage—including partial lowering, explicitly controlling thr
 
 ## Further Resources
 
+- [Programming Guides Overview](../programming_guides/overview.md)
+- [Language Basics](../programming_guides/language_basics.md)
+- [Software Pipeline](../programming_guides/software_pipeline.md)
+- [Current GEMM Example](../../examples/gemm/example_gemm.py)
 - [TileLang GitHub](https://github.com/tile-ai/tilelang)
 - [BitBLAS](https://github.com/tile-ai/bitblas)
 - [Triton](https://github.com/openai/triton)

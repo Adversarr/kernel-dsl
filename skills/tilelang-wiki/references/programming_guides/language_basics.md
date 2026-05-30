@@ -1,10 +1,11 @@
 # Language Basics
 
-This page introduces the core TileLang (tile‑lang) DSL that you’ll use to write
-high‑performance kernels. It focuses on how to define a kernel, express
-iteration, move data across memory scopes, and run it with JIT.
+This page introduces the TileLang surface used by current working examples:
+`@tilelang.jit`, `T.const`, `T.Tensor`, `T.empty`, `T.Kernel`, scoped
+allocations, `T.copy`, and the minimal tiled kernel structure that later guides
+assume.
 
-The examples use the conventional aliases:
+The examples use the conventional imports:
 
 ```python
 import tilelang
@@ -12,231 +13,338 @@ import tilelang.language as T
 from tilelang import jit
 ```
 
-## 1. Defining a Kernel with `@T.prim_func`
+## Defining A JIT Kernel
 
-TileLang kernels are TIR (TVM IR) functions produced by the `@T.prim_func`
-decorator. Arguments are annotated with shapes and dtypes via `T.Tensor` or
-`T.Buffer`.
-
-Note on dtypes
-- You can pass dtypes as a string (e.g., 'float32'), a TileLang dtype (e.g., `T.float32`),
-  or a framework dtype (e.g., `torch.float32`). TileLang normalizes all of these.
-  See Type System for details.
+Most examples define a Python function decorated with `@tilelang.jit`. Tensor
+arguments are ordinary Python parameters first, then annotated inside the body
+with TileLang tensor types. Return tensors are allocated with `T.empty`. The
+shorter `@jit` alias is also common in example code.
 
 ```python
-@T.prim_func
-def add_kernel(
-    A: T.Tensor((N,), dtype),    # dtype could be 'float32' | T.float32 | torch.float32
-    B: T.Tensor((N,), dtype),
-    C: T.Tensor((N,), dtype),
-):
-    ...  # kernel body
+@tilelang.jit
+def add(A, B, block_M: int, block_N: int, dtype=T.float32):
+    M, N = T.const("M, N")
+
+    A: T.Tensor((M, N), dtype)
+    B: T.Tensor((M, N), dtype)
+    C = T.empty((M, N), dtype)
+
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        for i, j in T.Parallel(block_M, block_N):
+            C[by * block_M + i, bx * block_N + j] = (
+                A[by * block_M + i, bx * block_N + j]
+                + B[by * block_M + i, bx * block_N + j]
+            )
+
+    return C
 ```
 
-- Shapes may be concrete integers or symbolic. For symbolic, you can pass
-  Python ints through the outer `@jit` wrapper (shown below), or annotate with
-  `T.dyn` when you want a named symbolic dimension.
+`T.const("M, N")` declares dimensions that TileLang infers from the actual
+tensor arguments when the JIT function is compiled or called. Use it for shape
+symbols that should be known from inputs.
+
+For dtypes, examples commonly use either TileLang dtypes such as `T.float16`
+and `T.float32` or string forms such as `"float16"` and `"float32"`. The
+deeper normalization details live in `type_system.md`; for most kernels, pick
+one clear style and use it consistently.
+
+Use `T.dynamic(name)` when a symbolic dimension must stay dynamic in the
+generated kernel:
 
 ```python
-# Named symbolic dimension (optional)
-K = T.dyn['K']
-@T.prim_func
-def uses_dyn(A: T.Tensor((K,), 'float32')):
+@tilelang.jit
+def dynamic_matmul(A, B, block_M, block_N, block_K):
+    M = T.dynamic("m")
+    N = T.dynamic("n")
+    K = T.dynamic("k")
+
+    A: T.Tensor((M, K), T.float16)
+    B: T.Tensor((K, N), T.float16)
+    C = T.empty((M, N), T.float16)
     ...
+    return C
 ```
 
-### Dynamic symbolic dimensions: two ways
+`T.symbolic(...)` exists as a deprecated alias of `T.dynamic(...)`; prefer
+`T.dynamic`.
 
-TileLang supports two complementary ways to introduce symbolic (dynamic) dims:
-
-- Type-level annotations via `T.dyn[...]` (recommended for function signatures)
-  - Use in `T.Tensor((T.dyn['K'], ...), dtype)` or bind once then reuse (as above).
-  - Inside the kernel body, prefer reading from the buffer’s shape, e.g. `M = A.shape[0]`.
-
-- Term-level variables via `T.dynamic(name, dtype)`
-  - Creates a TIR `tir.Var` you can use directly in expressions/loops.
-  - Handy when you need to reference the dimension symbol in the body.
+For annotation-heavy code, `T.dyn["K"]` is a convenient shorthand when you want
+to bind a named symbolic dimension directly in a tensor type:
 
 ```python
-# 1) Annotation-only symbol; read the bound size via shape
-K = T.dyn['K']  # dtype defaults to int32
+K = T.dyn["K"]
+
 @T.prim_func
-def foo(A: T.Tensor((K,), 'float32')):
+def uses_dyn(A: T.Tensor((K,), "float32")):
     N = A.shape[0]
     for i in T.serial(N):
         ...
-
-# 2) Explicit Var symbol usable in the body
-K = T.dynamic('K', 'int32')   # or T.dynamic('K') defaults to int32
-@T.prim_func
-def bar(A: T.Tensor((K,), 'float32')):
-    for i in T.serial(K):
-        ...
 ```
 
-Notes
-- `T.symbolic(name, dtype)` is a deprecated alias of `T.dynamic`; prefer `T.dynamic`.
-- Under `@jit`, concrete sizes come from the actual tensor arguments at the first call.
-- Symbols in annotations do not need to be separate kernel arguments; TileLang binds them from argument shapes.
+Use `T.dyn[...]` when the symbol mainly lives in the function signature. Use
+`T.dynamic(...)` when you need a first-class symbolic variable inside loop
+bounds, indexing expressions, or helper calculations.
 
-## 2. Launching Work with `T.Kernel`
+## Nested `@T.prim_func`
 
-`with T.Kernel(...)` declares a launch context and creates block/thread
-bindings. For GPU backends, specify a grid and threads per block.
+Some examples use `@tilelang.jit` as a factory that returns a nested
+`@T.prim_func`. This is useful when the output buffers are explicit arguments or
+when compile options such as `out_idx` are attached to the JIT wrapper.
 
 ```python
-with T.Kernel(grid_x, grid_y, threads=128) as (bx, by):
-    ...  # bx/by are blockIdx.x/y
+@tilelang.jit(out_idx=[2])
+def add_factory(M: int, N: int, dtype=T.float32):
+    @T.prim_func
+    def add_kernel(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, 32), T.ceildiv(M, 32), threads=128) as (bx, by):
+            for i, j in T.Parallel(32, 32):
+                row = by * 32 + i
+                col = bx * 32 + j
+                C[row, col] = A[row, col] + B[row, col]
+
+    return add_kernel
 ```
 
-You rarely need raw thread indices; most kernels use structured loops
-(`T.serial`, `T.unroll`, `T.Parallel`, `T.Pipelined`) inside a `T.Kernel`.
+Both styles share the same body language.
 
-## 3. Loops and Control Flow
+## Launch Regions With `T.Kernel`
 
-Core loop constructs map to familiar hardware patterns:
+`with T.Kernel(...)` creates a launch region. Positional arguments are grid
+extents for `blockIdx.x`, `blockIdx.y`, and `blockIdx.z`; `threads=` describes
+the block dimensions.
 
-- `T.serial(start, stop[, step])`: plain for‑loop
-- `T.unroll(start, stop[, step])`: unrolled loop
-- `T.Parallel(ext0, ext1, ...)`: nested parallel loops (elementwise‑friendly)
-- `T.Pipelined(iters, num_stages=N)`: software pipelining for producer/consumer
+```python
+with T.Kernel(grid_x, grid_y, grid_z, threads=128) as (bx, by, bz):
+    ...
+
+with T.Kernel(grid_x, threads=(block_x, block_y)) as bx:
+    tx = T.get_thread_binding(0)
+    ty = T.get_thread_binding(1)
+    ...
+```
+
+Most tile-level code uses `T.Parallel` and tile operations instead of direct
+thread indices. Direct thread bindings are still useful for lower-level kernels
+such as GEMV, reductions, atomics, and vectorized loads.
+
+`T.Kernel(..., is_cpu=True)` is available for CPU-style launch frames. Target
+names are handled by the compile/JIT target selection layer; common target
+strings include `auto`, `cuda`, `hip`, `metal`, `llvm`, `c`, `webgpu`, and
+`cutedsl`. `cluster_dims=` is available for cluster launch on supported GPU
+targets.
+
+## Memory Scopes
+
+TileLang exposes several allocation helpers:
+
+```python
+A_shared = T.alloc_shared((block_M, block_K), dtype)
+B_shared = T.alloc_shared((block_K, block_N), dtype)
+C_frag = T.alloc_fragment((block_M, block_N), T.float32)
+tmp = T.alloc_local((4,), dtype)
+scale = T.alloc_var("float32", init=1.0)
+```
+
+Common scopes:
+
+- `T.Tensor(...)` arguments and `T.empty(...)` outputs live in global memory.
+- `T.alloc_shared(...)` allocates block-visible shared memory. Its default
+  scope is dynamic shared memory (`shared.dyn`).
+- `T.alloc_fragment(...)` allocates fragment/register storage that tile
+  operators such as `T.gemm` and reductions can use.
+- `T.alloc_local(...)` allocates thread-local local storage.
+- `T.alloc_var(...)` allocates a single scalar-like local buffer.
+
+Use `T.clear(buffer)` or `T.fill(buffer, value)` to initialize accumulators and
+temporary buffers.
+
+## Moving Data
+
+`T.copy(src, dst)` is the standard tile copy primitive. It accepts buffer slices,
+buffer regions, and buffers; the compiler lowers it according to source and
+destination scopes. Treat it as the default movement primitive with synchronous
+semantics: after the statement, it is safe to consume `dst`.
+
+```python
+T.copy(A[by * block_M, k * block_K], A_shared)
+T.copy(B[k * block_K, bx * block_N], B_shared)
+T.copy(C_frag, C[by * block_M, bx * block_N])
+```
+
+`T.copy` is used for global-to-shared, shared-to-fragment, fragment-to-shared,
+and fragment/shared-to-global movement in the examples. For explicit async-copy
+work, use the lower-level async copy and wait primitives covered in the
+instructions and software-pipeline guides.
+
+Use `T.async_copy(src, dst)` only when you intentionally want manual overlap
+between copy and compute. Unlike `T.copy`, it does not imply the wait needed to
+consume `dst`: insert the appropriate wait operation before the first read of
+the asynchronously produced tile, then rely on the relevant synchronization
+rules for the scope you are using.
+
+## Loops
+
+TileLang loop helpers describe both logical iteration and lowering intent:
 
 ```python
 for i in T.serial(N):
     ...
 
-for i, j in T.Parallel(M, N):
-    C[i, j] = A[i, j] + B[i, j]
+for i in T.serial(0, N, 2):
+    ...
 
-for k in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
-    # overlap copy/compute across stages
+for i, j, k in T.grid(M, N, K):
+    ...
+
+for k in T.unroll(4):
+    ...
+
+for k in T.vectorized(tile):
+    ...
+
+for i, j in T.Parallel(block_M, block_N):
+    ...
+
+for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
     ...
 ```
 
-Conditionals use standard Python `if`/`else`. Guard edges with predicates when
-tile sizes do not divide problem sizes evenly.
+`T.Parallel` creates a parallel loop nest and is the default for elementwise
+tile work. `T.Pipelined` is the common loop form around repeated copy/compute
+stages, especially GEMM and attention.
 
-## 4. Memory Scopes and Allocation
+In eager JIT code, ordinary Python `range(...)` is also supported and maps to a
+serial TileLang loop. Use `T.grid(...)` when you want a compact Cartesian
+product loop nest, most often in CPU-style scalar kernels or simple nested
+iteration.
 
-TileLang exposes key software‑managed scopes:
+For the full loop and branching surface, including `while`, `break`,
+`continue`, guard patterns, and thread bindings, see `control_flow.md`. For the
+exact semantics of `T.Pipelined`, see `software_pipeline.md`.
 
-- Global: device memory (default for `T.Tensor` arguments)
-- Shared: on‑chip, block‑visible (`T.alloc_shared(shape, dtype)`)
-- Fragment and scalars: per‑thread fragments and scalar vars but in Shared View
-  (`T.alloc_fragment`, `T.alloc_var`)
+## Conditions And Selection
 
-```python
-A_shared = T.alloc_shared((BM, BK), 'float16')
-B_shared = T.alloc_shared((BK, BN), 'float16')
-C_local  = T.alloc_fragment((BM, BN), 'float32')
-T.clear(C_local)  # zero accumulators
-```
-
-## 5. Moving Data: `T.copy`
-
-Use `T.copy(src, dst)` to move tiles between scopes. It accepts buffers,
-buffer regions, or buffer loads; extents are inferred or can be broadcast.
+Use Python `if`/`elif`/`else` inside kernels for control flow:
 
 ```python
-# Global -> Shared (tile copy), extents inferred from dst
-T.copy(A[by * BM, ko * BK], A_shared)
-T.copy(B[ko * BK, bx * BN], B_shared)
-
-# Fragment -> Global (store back)
-T.copy(C_local, C[by * BM, bx * BN])
+if trans_A:
+    T.copy(A[k * block_K, by * block_M], A_shared)
+else:
+    T.copy(A[by * block_M, k * block_K], A_shared)
 ```
 
-`T.copy` performs coalescing and scope‑specific lowering during compilation.
-
-If you need explicitly asynchronous global->shared prefetch for manual pipelining,
-use `T.async_copy(src, dst)`. Unlike `T.copy`, it does not auto-insert any wait:
-you must explicitly insert `T.ptx_wait_group(...)` before consuming `dst`. A
-shared-memory barrier is still required for cross-thread consumption, but in
-most TileLang programs you do not need to write it manually because
-`ThreadSync("shared")` will insert the necessary `T.tvm_storage_sync("shared")`
-before the first read from `dst`.
-
-## 6. A Minimal End‑to‑End Example (Vector Add)
+Use `T.if_then_else(cond, true_value, false_value)` when you need an expression
+value inside an assignment:
 
 ```python
-import tilelang
-import tilelang.language as T
-from tilelang import jit
-
-@jit  # infers target from tensors at first call
-def add(N: int, block: int = 256, dtype: str = 'float32'):
-
-    @T.prim_func
-    def add_kernel(
-        A: T.Tensor((N,), dtype),
-        B: T.Tensor((N,), dtype),
-        C: T.Tensor((N,), dtype),
-    ):
-        with T.Kernel(T.ceildiv(N, block), threads=block) as bx:
-            for i in T.Parallel(block):
-                gi = bx * block + i
-                # Optional — LegalizeSafeMemoryAccess inserts a guard when an access may be OOB
-                C[gi] = A[gi] + B[gi]
-
-    return add_kernel
-
-# Host side (PyTorch shown; NumPy/DLPack also supported)
-import torch
-N = 1 << 20
-A = torch.randn(N, device='cuda', dtype=torch.float32)
-B = torch.randn(N, device='cuda', dtype=torch.float32)
-C = torch.empty(N, device='cuda', dtype=torch.float32)
-
-kernel = add(N)
-kernel(A, B, C)  # runs on GPU
-torch.testing.assert_close(C, A + B)
+acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
 ```
 
-Notes
-- The `@jit` wrapper returns a callable kernel after the first compilation.
-- You can pass compile‑time tunables (tile sizes, dtypes) through the outer
-  Python function and bake them into the generated TIR.
+`T.if_then_else` is also useful for guarding value-producing loads because the
+untaken branch is not evaluated.
 
-## 7. Tiled GEMM Skeleton
-
-Below is a minimal pattern for a tiled GEMM using shared memory staging and a
-fragment accumulator. It mirrors the quickstart style found in the repository.
+Python boolean operators are commonly used in examples for compound predicates:
 
 ```python
-@T.prim_func
-def gemm(
-    A: T.Tensor((M, K), 'float16'),
-    B: T.Tensor((K, N), 'float16'),
-    C: T.Tensor((M, N), 'float16'),
-):
-    with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
-        A_s = T.alloc_shared((BM, BK), 'float16')
-        B_s = T.alloc_shared((BK, BN), 'float16')
-        C_f = T.alloc_fragment((BM, BN), 'float32')
-        T.clear(C_f)
-
-        for ko in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
-            T.copy(A[by * BM, ko * BK], A_s)
-            T.copy(B[ko * BK, bx * BN], B_s)
-            T.gemm(A_s, B_s, C_f)  # lowered to tensor‑core/ISA specific kernels
-
-        T.copy(C_f, C[by * BM, bx * BN])
+if i_s <= i_t and i_s >= 0:
+    ...
 ```
 
-## 8. Debugging and Printing
+`T.any_of(buffer_or_region)` and `T.all_of(buffer_or_region)` are reductions
+over boolean buffers or regions; they are not variadic predicate builders.
 
-Use `T.print` inside a kernel for quick introspection. TileLang emits printing
-from a single thread for shared/fragment scopes to avoid floods.
+This page keeps conditions brief because `control_flow.md` owns the full
+branching and boundary-handling guidance.
+
+## Tile Operators And Math
+
+Useful operations seen throughout the examples include:
 
 ```python
-T.print(C_f, msg='accumulator:')
-T.print(A_s, msg='A tile:')
-T.print(C[0], msg='C[0] = ')
+T.gemm(A_shared, B_shared, C_frag)
+T.reduce_max(scores, scores_max, dim=1)
+T.reduce_sum(scores, scores_sum, dim=1)
+T.atomic_add(dst, value)
+T.exp2(x)
+T.log2(x)
+T.max(a, b)
+T.min(a, b)
+T.infinity(dtype)
+T.cast(value, dtype)
 ```
 
-## 9. Where to Go Next
+TileLang also exposes target-specific instructions and layout annotations for
+advanced kernels. Keep simple kernels at the tile-operator level until
+profiling shows a need for lower-level control.
 
-- Control flow details: see Programming Guides → Control Flow
-- Memory topics: see Programming Guides → (removed cache/layout); basics are covered inline
-- Autotuning tile sizes and mappings: Programming Guides → Autotuning
-- Operator examples (GEMM, GEMV, attention): see Deep Learning Operators
+For the full instruction surface, including async copy, TMA, reductions,
+atomics, synchronization, and warp intrinsics, see `instructions.md`.
+
+## Calling, Compiling, And Profiling
+
+You can call a JIT function directly:
+
+```python
+C = add(A, B, block_M=32, block_N=32, dtype=T.float32)
+```
+
+Or compile it explicitly, then call the compiled object:
+
+```python
+kernel = matmul.compile(M=1024, N=1024, K=1024, block_M=128, block_N=128, block_K=32)
+C = kernel(A, B)
+
+print(kernel.get_kernel_source())
+latency_ms = kernel.get_profiler().do_bench()
+```
+
+Direct calls are concise for testing. Explicit `.compile(...)` is useful when
+you want generated source, profiler handles, or repeated calls with a fixed
+configuration.
+
+## Canonical Minimal GEMM Pattern
+
+This is the canonical TileLang teaching skeleton used by the quickstart and
+GEMM examples. Other programming guides refer back to this pattern rather than
+repeating the full kernel:
+
+```python
+@tilelang.jit
+def matmul(A, B, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    M, N, K = T.const("M, N, K")
+    A: T.Tensor((M, K), dtype)
+    B: T.Tensor((K, N), dtype)
+    C = T.empty((M, N), dtype)
+
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        A_shared = T.alloc_shared((block_M, block_K), dtype)
+        B_shared = T.alloc_shared((block_K, block_N), dtype)
+        C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+
+        T.clear(C_local)
+        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+            T.copy(A[by * block_M, k * block_K], A_shared)
+            T.copy(B[k * block_K, bx * block_N], B_shared)
+            T.gemm(A_shared, B_shared, C_local)
+
+        T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return C
+```
+
+Use this skeleton as the starting point for tiled matrix operations, then add
+post-ops, layout annotations, swizzling, or autotuning only when needed.
+
+Follow-on guides assume this structure:
+
+- `instructions.md` explains what `T.copy`, `T.gemm`, reductions, and sync
+  primitives do.
+- `control_flow.md` explains loop forms, branch semantics, and boundary guards.
+- `software_pipeline.md` explains how `T.Pipelined(..., num_stages=...)` is
+  lowered and how manual stage/order annotations work.
+- `autotuning.md` explains how to turn this kind of kernel into a tuned kernel
+  factory.

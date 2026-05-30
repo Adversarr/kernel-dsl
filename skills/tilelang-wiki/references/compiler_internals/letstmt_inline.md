@@ -8,7 +8,7 @@ A `LetStmt` (Let Statement) is a temporary variable binding in the IR (Intermedi
 
 ## When Does LetStmt Get Inlined?
 
-The inlining logic is implemented in `src/transform/simplify.cc`. A `LetStmt` will be inlined if **both** of the following conditions are met:
+The inlining logic lives in TileLang's simplification pass. A `LetStmt` will be inlined if **both** of the following conditions are met:
 
 ### 1. The value satisfies `CanInlineLetStmt`
 
@@ -127,7 +127,7 @@ If this causes issues (e.g., `A[idx]` being read twice with different values due
 
 ## Controlling Let Inlining via Pass Config
 
-TileLang exposes an explicit pass configuration key, `tilelang.PassConfigKey.TL_FORCE_LET_INLINE` (`"tl.force_let_inline"`), that allows users to force the eager `LetInline` pass to run before the legalization pipeline begins. When enabled, the pipeline invokes `tilelang.transform.LetInline()` at the start of `LowerAndLegalize` (see `tilelang/engine/phase.py`). This knob is useful when debugging LetStmt-related issues or when deterministic inlining behavior is desired across different environments.
+TileLang exposes an explicit pass configuration key, `tilelang.PassConfigKey.TL_FORCE_LET_INLINE` (`"tl.force_let_inline"`), that allows users to force the eager `LetInline` pass to run before the legalization pipeline begins. When enabled, the pipeline invokes `tilelang.transform.LetInline()` at the start of `LowerAndLegalize`. This knob is useful when debugging LetStmt-related issues or when deterministic inlining behavior is desired across different environments.
 
 ```python
 from tilelang import transform
@@ -139,7 +139,7 @@ with transform.PassContext(
     lowered_mod = LowerAndLegalize(input_mod, target)
 ```
 
-If the flag is left unset (the default), the eager pass is only applied when downstream transforms opt in (for example, by calling `_Simplify(..., inline_let=True)` inside Tile operators). The guard in `tilelang/engine/phase.py` ensures the eager pass is only triggered when the user explicitly requests it.
+If the flag is left unset (the default), the eager pass is only applied when downstream transforms opt in (for example, by calling `_Simplify(..., inline_let=True)` inside Tile operators). The pipeline guard ensures the eager pass is only triggered when the user explicitly requests it.
 
 ## Summary
 
@@ -155,9 +155,9 @@ Understanding when inlining happens is crucial for:
 - Writing efficient TileLang programs
 - Identifying potential optimization opportunities or bugs
 
-## Related Files
+## Related Components
 
-- `src/transform/simplify.cc`: Main Simplify implementation
-- `src/transform/frontend_legalize.cc`: Standalone LetInline pass
-- `tilelang/engine/phase.py`: Pipeline integration for eager LetInlining
-- `testing/python/transform/test_tilelang_transform_let_inline.py`: Regression coverage for the pass
+- Simplify pass: main LetStmt inlining behavior
+- Frontend legalization: standalone eager LetInline pass
+- Lowering pipeline: integration point for eager LetInlining
+- Regression tests: coverage for forced and default inlining behavior

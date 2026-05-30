@@ -1,9 +1,6 @@
 # 🚀 Write High Performance FlashMLA with TileLang on Hopper
 
-<div style="text-align: left;">
-    <em>Author:</em> <a href="https://github.com/chengyupku">Yu Cheng</a>
-    <em>Author:</em> <a href="https://github.com/LeiWang1999">Lei Wang</a>
-</div>
+*Authors: [Yu Cheng](https://github.com/chengyupku), [Lei Wang](https://github.com/LeiWang1999)*
 
 TileLang is a user-friendly AI programming language that significantly lowers the barrier to kernel programming, helping users quickly build customized operators. However, users still need to master certain programming techniques to better leverage TileLang's powerful capabilities. Here, we'll use MLA as an example to demonstrate how to write high-performance kernels with TileLang.
 
@@ -15,21 +12,13 @@ DeepSeek's MLA (Multi-Head Latent Attention) is a novel attention mechanism know
 
 We benchmarked the performance of FlashMLA, TileLang, Torch, Triton, and FlashInfer under batch sizes of 64 and 128, with float16 data type, as shown in the figures below.
 
-```{figure} ../_static/img/mla_hopper/bs64_float16.png
-:width: 50%
-:alt: Overview
-:align: center
+![Performance under batch size 64](../../examples/deepseek_mla/figures/bs64_float16.png)
 
 Figure 1: Performance under batch size=64
-```
 
-```{figure} ../_static/img/mla_hopper/bs128_float16.png
-:width: 50%
-:alt: Overview
-:align: center
+![Performance under batch size 128](../../examples/deepseek_mla/figures/bs128_float16.png)
 
 Figure 2: Performance under batch size=128
-```
 
 As shown in the results, TileLang achieves performance comparable to FlashMLA in most cases, significantly outperforming both FlashInfer and Triton.
 Notably, **TileLang accomplishes this with just around 80 lines of Python code**, demonstrating its exceptional ease of use and efficiency. Let's dive in and see how TileLang achieves this.
@@ -51,7 +40,7 @@ for i in range(loop_range):
     scores_scale = exp(scores_max_prev - scores_max)
     acc_o *= scores_scale
     acc_s = exp(acc_s - scores_max)
-    acc_o = acc_s @ V[i]
+    acc_o += acc_s @ V[i]
     ...
 ```
 
@@ -71,21 +60,13 @@ While the above process may seem complex, but don't worry - TileLang will handle
 
 Figure 3 and Figure 4 illustrate the frontend TileLang script and its corresponding execution plan for MLA. Here, `T.gemm` represents matrix multiplication operations, `transpose_B=True` indicates transposition of matrix B, and `policy=FullCol` specifies that each warpgroup computes one column (e.g., split the result matrix in vertical dimension). `T.copy` represents buffer-to-buffer copying operations.
 
-```{figure} ../_static/img/mla_hopper/qk_layout.jpg
-:width: 50%
-:alt: Overview
-:align: center
+![Buffer shapes in Q @ K](../../examples/deepseek_mla/figures/qk_layout.jpg)
 
 Figure 3: Buffer shapes in Q @ K
-```
 
-```{figure} ../_static/img/mla_hopper/pv_layout.jpg
-:width: 50%
-:alt: Overview
-:align: center
+![Buffer shapes in acc_s @ V](../../examples/deepseek_mla/figures/pv_layout.jpg)
 
 Figure 4: Buffer shapes in acc_s @ V
-```
 
 The mapping from TileLang frontend code to execution plan is accomplished through Layout Inference. Layout inference is a core optimization technique in TileLang. It automatically deduces the required buffer shapes and optimal layouts based on Tile-Operators (like `T.gemm`, `T.copy`, etc.), then generates the corresponding code. Here, we demonstrate a concrete example of buffer shape inference in MLA.
 
@@ -114,8 +95,10 @@ One common strategy to address bank conflicts is shared memory swizzling. This t
 Similarly, TileLang also supports shared memory swizzling. Users only need to add a single line of Python code:
 
 ```python
+import tilelang
+
 T.annotate_layout({
-    S_shared: TileLang.layout.make_swizzled_layout(S_shared),
+    S_shared: tilelang.layout.make_swizzled_layout(S_shared),
 })
 ```
 
@@ -129,19 +112,32 @@ In TileLang, users are completely shielded from these implementation details. Th
 
 ### Pipeline
 
-Pipeline is a technique used to improve memory access efficiency by overlapping memory access and computation. In TileLang, pipeline can be implemented through the `T.pipelined` annotation:
+Pipeline is a technique used to improve memory access efficiency by overlapping memory access and computation. In the current MLA examples, the KV loop is expressed with `T.Pipelined(..., num_stages=2)`:
 
 ```python
-T.pipelined(range: int, stage: int)
+for k in T.Pipelined(loop_range, num_stages=2):
+    ...
 ```
 
-Here, `range` specifies the range of the pipeline, and `stage` specifies the stage of the pipeline. Multi-stage pipelining enables overlapping of computation and memory access, which can significantly improve performance for memory-intensive operators. However, setting a higher number of stages consumes more shared memory resources, so the optimal configuration needs to be determined based on specific use cases.
+Multi-stage pipelining enables overlapping of computation and memory access, which can significantly improve performance for memory-intensive operators. However, setting a higher number of stages consumes more shared memory resources, so the optimal configuration needs to be determined based on specific use cases. For the maintained semantics of `T.Pipelined`, see [Software Pipeline](../programming_guides/software_pipeline.md).
 
 ### Split-KV
 
 We have also implemented Split-KV optimization similar to [FlashDecoding](https://pytorch.org/blog/flash-decoding/). Specifically, when the batch size is small, parallel SM resources cannot be fully utilized due to low parallelism. In such cases, we can split the kv_ctx dimension across multiple SMs for parallel computation and then merge the results.
 
 In our implementation, we have developed both split and combine kernels, allowing users to control the split size through a `num_split` parameter.
+
+The maintained source files for this operator family are:
+
+- `../../examples/deepseek_mla/example_mla_decode.py`
+- `../../examples/deepseek_mla/example_mla_decode_persistent.py`
+- `../../examples/deepseek_mla/example_mla_decode_paged.py`
+- `../../examples/deepseek_mla/README.md`
+
+For the maintained language reference behind these kernels, see
+[Language Basics](../programming_guides/language_basics.md),
+[Instructions](../programming_guides/instructions.md), and
+[Software Pipeline](../programming_guides/software_pipeline.md).
 
 ## 🚀 On AMD MI300X Accelerators
 
@@ -174,12 +170,9 @@ Key implementation differences between Hopper and MI300X architectures include:
 
 We conducted comparative performance analysis across multiple frameworks using float16 precision with batch sizes 64 and 128. The experimental results demonstrate:
 
-<figure style="text-align: center">
-  <a href="../figures/flashmla-amd.png">
-    <img src="../figures/flashmla-amd.png" alt="AMD FlashMLA Performance Comparison">
-   </a>
-  <figcaption style="text-align: center;">Figure 1: Computational throughput comparison across frameworks (Batch sizes 64 and 128)</figcaption>
-</figure>
+![AMD FlashMLA Performance Comparison](../../examples/deepseek_mla/figures/flashmla-amd.png)
+
+Figure 5: Computational throughput comparison across frameworks (batch sizes 64 and 128)
 
 Notably, TileLang achieves performance parity with hand-optimized assembly kernels (aiter-asm) in most test cases, while significantly outperforming both Triton (1.98×) and PyTorch (3.76×) implementations. This performance is achieved through a concise 80-line Python implementation, demonstrating TileLang's efficiency and programmability advantages.
 

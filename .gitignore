@@ -4,3 +4,4 @@ tmp/
 .codex
 .pytest_cache
 .venv
+.trae

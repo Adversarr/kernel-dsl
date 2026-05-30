@@ -1,9 +1,7 @@
 # General Matrix-Vector Multiplication (GEMV)
 ===========================================
 
-<div style="text-align: left;">
-    <em>Contributor: </em> <a href="https://github.com/botbw">@botbw</a>
-</div>
+*Contributor: [@botbw](https://github.com/botbw)*
 
 :::{warning}
    This document is still **experimental** and may be incomplete.
@@ -11,10 +9,12 @@
 :::
 
 :::{tip}
-Example code can be found at `examples/gemv/example_gemv.py`.
+The current working source for this tutorial lives at `../../examples/gemv/example_gemv.py`.
 :::
 
 General matrix-vector multiplication (GEMV) can be viewed as a specialized case of general matrix-matrix multiplication (GEMM). It plays a critical role in deep learning, especially during the inference phase of large language models. In this tutorial, we will optimize GEMV from a thread-level perspective step by step using `TileLang`.
+
+When the document and the example file disagree, treat `../../examples/gemv/example_gemv.py` as the source of truth. In particular, the maintained example now includes both the thread-level progression shown below and a higher-level reducer-based implementation, `gemv_alloc_reducer`, built with `T.alloc_reducer(...)`.
 
 ## Triton Implementation
 When implementing a GEMV kernel, you might start with a high-level approach using a tool like `Triton`.
@@ -255,7 +255,7 @@ With vectorized read, now the kernel finishes in **~0.0084 ms**, which is gettin
 
 ## `tvm_thread_allreduce` Instead of `atomicAdd`
 
-[`tvm_thread_allreduce`](https://tvm.apache.org/docs/reference/api/python/tir/tir.html#tvm.tir.tvm_thread_allreduce) has implemented optimization when making an all-reduce across a number of threads, which should outperfrom out plain smem + `atomidAdd`:
+[`tvm_thread_allreduce`](https://tvm.apache.org/docs/reference/api/python/tir/tir.html#tvm.tir.tvm_thread_allreduce) implements an optimized all-reduce across a number of threads, which should outperform our plain shared-memory reduction plus `atomicAdd`:
 
 ```python
 def splitk_gemv_vectorized_tvm(
@@ -458,4 +458,7 @@ This corresponds closely to our `TileLang` program, with necessary synchronizati
 | splitk_gemv_vectorized_tvm | 0.00675 ms |
 
 Triton Time: 0.0077344514429569244
-In this tutorial, we implemented a simple GEMV kernel and learn that `TileLang` exposes low level control to user such as thread-level programming and CUDA primitives.
+
+This tutorial focused on the thread-level GEMV progression. For the current in-repo source, also review `gemv_alloc_reducer` in `../../examples/gemv/example_gemv.py`, which shows how the same operator family can also be expressed with tile-level fragments, reducers, and a pipelined loop.
+
+For related background, see [Language Basics](../programming_guides/language_basics.md), [Instructions](../programming_guides/instructions.md), [Software Pipeline](../programming_guides/software_pipeline.md), and [Autotuning](../programming_guides/autotuning.md).

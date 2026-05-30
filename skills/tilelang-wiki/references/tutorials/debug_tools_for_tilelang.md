@@ -9,7 +9,7 @@
 A Tile Language program (hereafter referred to as a *program*) is transformed into a hardware-executable file through several stages:
 
 1. The user writes a Tile Language program.
-2. The program undergoes multiple *Passes* for transformation and optimization (the *lower* stage, see `tilelang/engine/lower.py`), finally producing an intermediate representation (e.g., LLVM or C for CPU, CUDA for NVIDIA GPUs, etc.).
+2. The program undergoes multiple *Passes* for transformation and optimization during the lower stage, finally producing an intermediate representation (e.g., LLVM or C for CPU, CUDA for NVIDIA GPUs, etc.).
 3. The generated code is compiled by the respective compiler (e.g., nvcc) into a hardware-executable file.
 
 ```{figure} ../_static/img/overview.png
@@ -91,7 +91,7 @@ Sometimes, the kernel compiles and runs but produces incorrect results. In such 
 
 ### Post-Processing Callbacks for Generated Source
 
-After code generation (in the codegen pass), TileLang calls a callback function (if registered) to allow post-processing of the generated source code. In `src/target/rt_mod_cuda.cc`:
+After code generation (in the codegen pass), TileLang calls a callback function (if registered) to allow post-processing of the generated source code. The core flow looks like this:
 
 ```cpp
 std::string code = cg.Finish();

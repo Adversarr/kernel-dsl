@@ -1,353 +1,241 @@
-# Cluster TMA: Multicast and SM-to-SM Copy
+# Cluster TMA
 
-This page describes two advanced data-movement features that are available on
-NVIDIA Hopper (SM90) and later: **TMA multicast** and **SM-to-SM cluster
-copy**. Both features are exposed through extensions to the existing `T.copy`
-operator and require a kernel launched with thread block cluster, i.e., with `cluster_dims != (1, 1, 1)`.
+This guide covers TileLang's cluster-aware data movement on NVIDIA SM90+
+targets:
 
-Requirements:
-- CUDA Compute Capability ≥ 9.0 (Hopper / Blackwell / RTX 5090)
+- TMA multicast: one descriptor TMA load can deliver the same global-memory tile
+  to multiple CTAs in a cluster.
+- SM-to-SM shared-memory copy: one CTA can write into another CTA's shared
+  memory inside the same cluster.
 
----
+The public API for both features is `T.copy_cluster(...)`. Internally it is
+lowered as a `tl.tileop.copy` with cluster annotations.
 
-## Background: Thread Block Clusters
+For the baseline `T.copy`, `T.tma_copy`, and synchronization terminology used by
+this guide, see `instructions.md`.
 
-A *thread block cluster* is a group of CTAs that share a common virtual address
-space for their shared-memory regions and can communicate without going through
-global memory. Within a cluster, each CTA has a *block rank* (0-indexed
-position inside the cluster), and all CTAs can observe each other's shared
-memory via the `shared::cluster` address space.
+These features require a kernel launched with thread-block clusters:
 
 ```python
-with T.Kernel(grid_x, grid_y, threads=128, cluster_dims=(4, 1, 1)) as (bx, by):
-    rank  = T.block_rank_in_cluster()   # 0..3 within this cluster
-    T.cluster_sync()                     # barrier across all CTAs in cluster
+with T.Kernel(num_blocks, threads=128, cluster_dims=2) as bx:
+    rank = T.block_rank_in_cluster()
 ```
 
----
+`cluster_dims` may be an integer, a list, or a tuple. `2` is normalized to
+`(2, 1, 1)`. `(1, 1, 1)` is treated as no cluster launch.
 
-## Feature 1 — TMA Multicast (`cluster_mask`)
+Cluster support is CUDA-only in the current implementation path and is guarded
+by SM90+ code. The CUDA runtime wrapper launches clustered kernels with
+`cudaLaunchKernelEx` and `cudaLaunchAttributeClusterDimension`.
 
-### What it does
+## Cluster Helpers
 
-Normally each CTA issues its own TMA load, fetching a tile from global memory
-into its private shared memory. With multicast, **a single TMA transaction
-broadcasts one global tile to every participating CTA simultaneously**, saving
-repeated DRAM traffic when multiple CTAs in a cluster need the same data (e.g.,
-the same K-panel in a split-K GEMM).
+TileLang exposes the following helper operations:
 
-```text
-Global memory ──TMA multicast──▶ shared memory (rank 0)
-                              └─▶ shared memory (rank 1)   (same tile, no extra DRAM read)
-                  TMA load    ──▶ shared memory (rank 2)   (independent tile)
-                  TMA load    ──▶ shared memory (rank 3)   (independent tile)
-```
+| Operation | Meaning |
+| --- | --- |
+| `T.block_rank_in_cluster()` | Returns the 1-D CTA rank inside the cluster (`%cluster_ctarank`). |
+| `T.cluster_arrive_relaxed()` | Emits `barrier.cluster.arrive.relaxed.aligned`. |
+| `T.cluster_arrive()` | Emits `barrier.cluster.arrive.aligned`. |
+| `T.cluster_wait()` | Emits `barrier.cluster.wait.aligned`. |
+| `T.cluster_sync()` | Emits cluster arrive followed by cluster wait. |
+| `T.alloc_cluster_barrier(counts)` | Allocates an mbarrier buffer in `shared.cluster_barrier` scope. |
+| `T.mbarrier_wait_parity(barrier, parity)` | Waits for an mbarrier phase. |
 
-### API
+The examples in `examples/gemm_sm100` and
+`examples/blockscaled_gemm_sm100` show the common
+Blackwell/SM100 pattern: launch `cluster_dims=2`, read
+`T.block_rank_in_cluster()`, allocate cluster barriers, and use mbarriers to
+coordinate 2-CTA tensor-core work.
+
+## API
 
 ```python
-T.copy_cluster(src_global, dst_shared, cluster_mask=<int>)
-```
-
-`cluster_mask` is a bitmask where each set bit identifies a CTA rank that
-participates in the multicast. The CTA whose rank equals the lowest set bit
-in the mask issues `cp.async.bulk.tensor … multicast::cluster`; every other
-CTA in the mask receives the data passively (no instruction issued). CTAs
-outside the mask perform a regular TMA load for their own tile.
-
-### Example
-
-```python
-import tilelang
-import tilelang.language as T
-
-def make_tma_multicast_kernel(M, N, block_M, block_N, cluster_mask):
-    @T.prim_func
-    def kernel(
-        A: T.Tensor((M, N), "float16"),
-        B: T.Tensor((M, N), "float16"),
-    ):
-        # 4 CTAs per cluster; ranks 0 and 1 share the same tile via multicast.
-        with T.Kernel(
-            T.ceildiv(N, block_N),
-            T.ceildiv(M, block_M),
-            threads=128,
-            cluster_dims=(4, 1, 1)
-        ) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_N), "float16")
-
-            # cluster_mask=0b0011: ranks 0 and 1 participate.
-            # Rank 0 issues tma_load_multicast; rank 1 receives passively.
-            # Ranks 2 and 3 each issue a regular tma_load.
-            T.copy_cluster(A[by * block_M, bx * block_N], A_shared,
-                           cluster_mask=cluster_mask)
-
-            T.copy(A_shared, B[by * block_M, bx * block_N])
-
-    return kernel
-```
-
-Running the kernel above with `cluster_mask = 0b0011`:
-
-| Rank | Action | `B` slice receives |
-|------|--------|--------------------|
-| 0 | issues multicast load | A tile at rank-0 address |
-| 1 | passively receives | **same** A tile as rank 0 |
-| 2 | regular TMA load | A tile at rank-2 address |
-| 3 | regular TMA load | A tile at rank-3 address |
-
-### Notes
-
-- The compiler lowers `cluster_mask != 0` to
-  `cp.async.bulk.tensor.Nd.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster`
-    for the issuing CTA; CTAs in the mask but not elected as issuer receive
-    passively, and only CTAs outside the mask issue a standard
-    `cp.async.bulk.tensor`.
-- Software-pipelining (`T.Pipelined`) is fully supported; the warp-specialized
-  rewriter recognises `tma_load_multicast` as a producer operation.
-- `cluster_mask` is a compile-time constant; dynamic masks are not supported.
-
----
-
-## Feature 2 — SM-to-SM Cluster Copy (`dst_block`)
-
-### What it does
-
-SM-to-SM copy lets one CTA **push data directly from its own shared memory
-into another CTA's shared memory** within the same cluster, without a round
-trip through global memory. This is useful for patterns such as:
-
-- Partial result exchange (e.g., split-K partial sums across SM boundaries)
-- Producer–consumer pipelines where the producer fills a neighbor's buffer
-- All-to-all collective communication within a cluster
-
-### Lowering paths
-
-The compiler selects one of three paths depending on whether `remote_barrier`
-is provided and whether the copy region is contiguous:
-
-| Path | Condition | Hardware instruction | Arrive count |
-|------|-----------|---------------------|--------------|
-| **TMA fast path** | `remote_barrier` set + region is contiguous | one `tl::tma_store_cluster` | 1 |
-| **Multi-TMA path** | `remote_barrier` set + ND region is non-contiguous | one `tl::tma_store_cluster` per contiguous row | number of rows |
-| **SIMT fallback** | no `remote_barrier`, or non-decomposable region | `map_shared_rank` scalar stores by all threads | auto-injected arrive if `remote_barrier` is set |
-
-A copy region is *contiguous* when its innermost dimension spans the full
-buffer width (i.e. the copy region `[..., 0:N_tile]` satisfies
-`N_tile == buffer_shape[-1]`). If the innermost extent is shorter, the region
-is non-contiguous and the TMA fast path is unavailable.
-
-### TMA fast path — bulk async copy with mbarrier
-
-```python
-T.copy_cluster(src_shared, dst_shared, dst_block=<rank>, remote_barrier=<mbarrier>)
-```
-
-A single elected thread issues one `cp.async.bulk.shared::cluster` instruction.
-The hardware DMA engine transfers the entire tile asynchronously and signals
-the destination CTA's mbarrier on completion. The destination CTA waits with
-`T.mbarrier_wait_parity`.
-
-Steps:
-1. Both CTAs allocate the **same** shared memory layout so their mbarriers live
-   at the same offset.
-2. Every CTA initialises its own barrier for 1 arrival via `T.alloc_cluster_barrier([1])`.
-3. The source CTA (`pid == 0` below) calls `T.copy_cluster(... dst_block=1, remote_barrier=...)`.
-4. The destination CTA (`pid == 1`) waits on its local barrier copy.
-
-```python
-import tilelang
-import tilelang.language as T
-
-@tilelang.jit(execution_backend="cython")
-def make_cluster_copy_kernel(N: int):
-    @T.prim_func
-    def kernel(
-        A: T.Tensor((N,), "float32"),
-        B: T.Tensor((N,), "float32"),
-    ):
-        with T.Kernel(2, threads=128, cluster_dims=(2, 1, 1)) as pid:
-            s_src     = T.alloc_shared((N,), "float32")
-            s_dst     = T.alloc_shared((N,), "float32")
-            s_barrier = T.alloc_cluster_barrier([1])
-
-            T.fill(s_src, 0.0)
-            T.fill(s_dst, 0.0)
-
-            T.cluster_sync()
-
-            if pid == 0:
-                # Load A into local shared memory.
-                for i in T.Parallel(N):
-                    s_src[i] = A[i]
-
-                # Async-push s_src → s_dst in CTA 1, signal CTA 1's barrier.
-                T.copy_cluster(s_src, s_dst, dst_block=1,
-                               remote_barrier=s_barrier[0])
-
-            if pid == 1:
-                # Wait until CTA 0 finishes writing.
-                T.mbarrier_wait_parity(s_barrier[0], 0)
-
-                for i in T.Parallel(N):
-                    B[i] = s_dst[i]
-
-    return kernel
-```
-
-Generated producer code (single-thread guard, one PTX instruction):
-
-```cuda
-if (((int)threadIdx.x) == 0) {
-    tl::tma_store_cluster(&s_dst[0], &s_src[0], 1,
-                          (uint32_t)(N * 4), s_barrier[0]);
-}
-```
-
-### Multi-TMA path — non-contiguous ND regions
-
-When `remote_barrier` is provided but the copy region is not fully contiguous
-(e.g. copying a 2-D slice `[0:M, 0:N_tile]` from a buffer of shape
-`[M, N_full]` where `N_tile < N_full`), the compiler automatically
-**decomposes the ND region into individual contiguous rows**, emitting one
-`tl::tma_store_cluster` call per row. The mbarrier `arrive_count` is updated
-to the total number of rows so the destination CTA's `mbarrier_wait_parity`
-completes only after all rows are transferred.
-
-```python
-# 2-D non-contiguous copy: N_tile < N_full → compiler emits M TMA calls
-s_src = T.alloc_shared((M, N_full), "float32")
-s_dst = T.alloc_shared((M, N_full), "float32")
-s_barrier = T.alloc_cluster_barrier([1])   # arrive_count updated to M at compile time
-
 T.copy_cluster(
-    s_src[0:M, 0:N_tile],
-    s_dst[0:M, 0:N_tile],
-    dst_block=1,
-    remote_barrier=s_barrier[0],
+    src,
+    dst,
+    *,
+    dst_block=None,
+    cluster_mask=None,
+    remote_barrier=None,
+    eviction_policy=None,
+    coalesced_width=None,
+    loop_layout=None,
 )
 ```
 
-The decomposition is recursive: a 3-D region `[0:D, 0:M, 0:N_tile]` (with
-`N_tile < N_full`) produces `D × M` TMA calls and sets `arrive_count = D * M`.
-Static extents are unrolled at compile time; symbolic extents emit TIR `For`
-loops.
+Use exactly one cluster-copy mode in normal code:
 
-The API is identical to the fast path — no change is required in user code.
+- `cluster_mask=...` selects TMA multicast for global-to-shared TMA loads.
+- `dst_block=...` selects SM-to-SM shared-memory copy.
 
-### SIMT fallback — element-by-element stores
+The implementation does not currently reject passing both. Since CUDA lowering
+checks `dst_block` first, such a call will take the SM-to-SM path and the
+multicast mask will not do what you intended.
 
-Omit `remote_barrier` to always use the SIMT fallback:
+## TMA Multicast
+
+TMA multicast is selected by passing `cluster_mask`:
 
 ```python
-T.copy_cluster(s_src, s_dst, dst_block=1)
+T.copy_cluster(A[by * BM, k * BK], A_shared, cluster_mask=0b0011)
 ```
 
-This lowers to a SIMT parallel loop where every thread writes one (or a few)
-elements into the remote CTA's shared memory via
-`cooperative_groups::map_shared_rank`. Because `map_shared_rank` returns a
-scalar pointer, vectorised writes are not possible. Use this path only when an
-mbarrier is unavailable or when the tile is too small to justify barrier
-overhead.
+`cluster_mask` is an integer bitmask of CTA ranks in the current cluster. The
+lowest set rank issues `tma_load_multicast`; CTAs in the mask receive the tile;
+CTAs outside the mask issue the regular TMA load for their own tile.
 
-When `remote_barrier` is provided but the region is neither contiguous nor
-decomposable into TMA rows, the compiler falls back to SIMT stores and
-**auto-injects a barrier arrive** (`__syncthreads()` + single-thread
-`s_barrier.arrive(1u)`) so the destination CTA can still wait on the same
-mbarrier without any API change.
+Important constraints:
 
-### Synchronisation contract
+- The source must be a global-memory tile and the destination must be shared
+  memory.
+- The copy must select the descriptor-based TMA load path. The 1-D bulk path
+  explicitly rejects multicast.
+- `cluster_mask` is effectively compile-time: the Python API type is `int`, and
+  the C++ lowering only reads an integer immediate from annotations.
+- Multicast is a load feature. It is not used for shared-to-shared SM-to-SM
+  copy.
 
-| | TMA fast path | Multi-TMA path | SIMT fallback |
-|-|---------------|----------------|---------------|
-| Source CTA | no wait needed; copy is async | no wait needed | effectively sync after the loop |
-| Destination CTA | `T.mbarrier_wait_parity(barrier, parity)` | `T.mbarrier_wait_parity(barrier, parity)` | `T.cluster_sync()` (no barrier), or `T.mbarrier_wait_parity` if auto-arrived |
-
-### Notes
-
-- All paths require `src` and `dst` to be in `shared` or `shared.dyn` scope.
-- The mbarrier must be allocated with `T.alloc_cluster_barrier([arrive_count])`.
-  The compiler updates `arrive_count` automatically for the multi-TMA path.
-- `T.cluster_sync()` after allocation but before the copy is required to ensure
-  all CTAs have reached the barrier-init point before any data is pushed.
-- `dst_block` may be a compile-time integer or a runtime `tir.PrimExpr`.
-- `cluster_mask` and `dst_block` are mutually exclusive in a single
-  `T.copy_cluster` call.
-
----
-
-## Cluster Helper Builtins
-
-| Builtin | Return | Description |
-|---------|--------|-------------|
-| `T.block_rank_in_cluster()` | `int32` | Block rank (0-indexed) within the cluster |
-| `T.cluster_sync()` | — | Barrier synchronisation across all cluster CTAs (arrive + wait) |
-| `T.cluster_arrive()` | — | Signal cluster barrier arrival (aligned) |
-| `T.cluster_arrive_relaxed()` | — | Signal cluster barrier arrival (relaxed) |
-| `T.cluster_wait()` | — | Wait for all cluster CTAs to arrive |
-| `T.alloc_cluster_barrier([count])` | `Buffer` | Allocate and initialise an mbarrier for `count` arrivals |
-| `T.mbarrier_arrive(bar)` | — | Signal one arrival on an mbarrier |
-| `T.mbarrier_wait_parity(bar, parity)` | — | Wait until `bar` flips to `parity` |
-
----
-
-## Putting It Together: Split-K Sketch
-
-A common pattern combining both features: multicast the shared K-panel to
-all cluster CTAs (saving DRAM bandwidth), then reduce partial sums with
-SM-to-SM copy (saving global-memory round trips).
+Minimal shape:
 
 ```python
 @T.prim_func
-def split_k_gemm(A, B, C):
-    with T.Kernel(grid_x, grid_y, threads=256, cluster_dims=(4, 1, 1)) as (bx, by):
-        rank    = T.block_rank_in_cluster()
-        A_s     = T.alloc_shared((BM, BK), "float16")
-        B_s     = T.alloc_shared((BK, BN), "float16")
-        C_f     = T.alloc_fragment((BM, BN), "float32")
-        C_s     = T.alloc_shared((BM, BN), "float32")
-        barrier = T.alloc_cluster_barrier([3])
-        T.clear(C_f)
+def kernel(A: T.Tensor((M, K), "float16"), B: T.Tensor((M, K), "float16")):
+    with T.Kernel(T.ceildiv(M, BM), threads=128, cluster_dims=2) as bx:
+        rank = T.block_rank_in_cluster()
+        A_shared = T.alloc_shared((BM, BK), "float16")
 
-        # Phase 1: each CTA loads its K-slice; A is multicast to rank 0 and 1.
-        for ko in T.Pipelined(T.ceildiv(K, BK * 4), num_stages=3):
-            k_off = (rank + ko * 4) * BK
-            T.copy_cluster(A[by * BM, k_off], A_s, cluster_mask=0b0011)
-            T.copy(B[k_off, bx * BN], B_s)
-            T.gemm(A_s, B_s, C_f)
+        # Rank 0 issues the multicast load for ranks 0 and 1.
+        T.copy_cluster(A[bx * BM, 0], A_shared, cluster_mask=0b11)
 
-        # Phase 2: push each rank's partial sums to rank 0 for accumulation.
-        #
-        # Use a per-rank staging slot so every non-zero rank writes to a
-        # distinct destination region — avoiding both a destination race and
-        # an arrival-count mismatch.  Each CTA stores its own partial into
-        # C_parts[rank]; non-zero ranks then push that slot to the matching
-        # slot in rank 0's shared memory.
-        #
-        # Arrival count must equal the number of producers: cluster_size - 1.
-        C_parts = T.alloc_shared((4, BM, BN), "float32")  # one slot per rank
-        T.copy(C_f, C_parts[rank])
+        # Both ranks can consume their local shared-memory copy after the
+        # synchronous TMA-load sequence emitted by the copy lowering.
+        T.copy(A_shared, B[bx * BM, 0])
+```
+
+In the CUDA lowering, multicast wraps the normal TMA load as:
+
+1. Compute the minimum CTA rank set in `cluster_mask`.
+2. If `block_rank_in_cluster() == min_rank`, emit `tma_load_multicast`.
+3. Else if the rank is not in the mask, emit the regular TMA load.
+4. Else emit no load instruction for that CTA.
+
+## SM-to-SM Cluster Copy
+
+SM-to-SM copy is selected by passing `dst_block`:
+
+```python
+T.copy_cluster(src_shared, dst_shared, dst_block=1)
+```
+
+Both `src` and `dst` must be `shared` or `shared.dyn` buffers. The destination
+CTA rank may be a constant or a runtime `PrimExpr`.
+
+There are two synchronization styles.
+
+### Async Bulk Copy With Remote Barrier
+
+When `remote_barrier` is provided and the source/destination regions have
+matching element counts, TileLang tries to use cluster TMA store:
+
+```python
+barrier = T.alloc_cluster_barrier([1])
+
+T.cluster_sync()
+
+if rank == 0:
+    T.copy_cluster(
+        src_shared,
+        dst_shared,
+        dst_block=1,
+        remote_barrier=barrier[0],
+    )
+
+if rank == 1:
+    T.mbarrier_wait_parity(barrier[0], 0)
+```
+
+For a contiguous region, the lowering emits one guarded call to:
+
+```text
+tl::tma_store_cluster(dst_ptr, src_ptr, dst_cta, size_bytes, barrier)
+```
+
+Only one elected thread issues the bulk copy. The hardware writes to the
+destination CTA's shared memory and signals the destination CTA's mbarrier.
+
+For a non-contiguous but same-shaped region, TileLang recursively decomposes the
+copy into contiguous rows and emits one `tma_store_cluster` per row. The barrier
+arrival count is updated to the number of emitted row copies.
+
+### SIMT Fallback
+
+Without `remote_barrier`, or when the bulk path cannot prove matching element
+counts and per-dimension extents, TileLang falls back to elementwise cluster
+stores:
+
+```python
+T.copy_cluster(src_shared, dst_shared, dst_block=1)
+```
+
+The fallback lowers destination stores to `ptx_cluster_store`, and CUDA codegen
+uses:
+
+```text
+cooperative_groups::this_cluster().map_shared_rank(...)
+```
+
+If a remote barrier was supplied but the copy falls back to SIMT stores,
+TileLang appends a shared-memory sync and a single-thread cluster-barrier
+arrival so the destination CTA can still wait on the requested mbarrier.
+
+## Synchronization Rules
+
+- Use `T.cluster_sync()` after shared/barrier allocation and before a CTA pushes
+  data into another CTA's shared memory. This ensures all CTAs reached the
+  allocation/barrier initialization point.
+- For `remote_barrier` copies, the destination CTA waits with
+  `T.mbarrier_wait_parity(remote_barrier, parity)`.
+- For fallback copies without a remote barrier, use cluster-level coordination
+  such as `T.cluster_sync()` before reading the destination shared memory.
+- Allocate enough barrier arrivals for the number of producers. Multi-row TMA
+  decomposition updates the recorded count for that barrier allocation, but
+  multiple independent producer CTAs still require the logical count to match
+  the number of arrivals you expect.
+
+## Practical Pattern
+
+For 2-CTA kernels, a common layout is:
+
+```python
+@T.prim_func
+def kernel(A: T.Tensor((N,), "float32"), B: T.Tensor((N,), "float32")):
+    with T.Kernel(2, threads=128, cluster_dims=2) as bid:
+        rank = T.block_rank_in_cluster()
+        src = T.alloc_shared((N,), "float32")
+        dst = T.alloc_shared((N,), "float32")
+        done = T.alloc_cluster_barrier([1])
+
+        for i in T.Parallel(N):
+            src[i] = A[i]
 
         T.cluster_sync()
 
-        if rank != 0:
-            # Push this rank's slot to the *same* slot index in rank 0's
-            # C_parts — different offsets, so no destination race.
-            T.copy_cluster(C_parts[rank], C_parts[rank],
-                           dst_block=0, remote_barrier=barrier[0])
-
         if rank == 0:
-            T.mbarrier_wait_parity(barrier[0], 0)  # wakes after all 3 arrivals
-            # C_parts[0..3] in rank 0's smem now hold all four partial sums.
-            # accumulate and store ...
-            T.copy(C_parts[0], C[by * BM, bx * BN])
+            T.copy_cluster(src, dst, dst_block=1, remote_barrier=done[0])
+
+        if rank == 1:
+            T.mbarrier_wait_parity(done[0], 0)
+            for i in T.Parallel(N):
+                B[i] = dst[i]
 ```
 
----
+For multicast, keep the mental model separate: use `cluster_mask` only on a
+global-to-shared TMA load when more than one CTA needs the same global tile.
 
-## See Also
+## Implementation Pointers
 
-- `testing/python/cuda/test_tma_multicast_demo.py` — multicast validation
-- `testing/python/cuda/test_tma_dsmem.py` — SM-to-SM copy validation (fast path, multi-TMA, and SIMT fallback)
-- Programming Guides → Instructions — complete `T.copy` parameter reference
-- Programming Guides → Control Flow — `T.Pipelined` and warp-specialized pipelines
+- The public API is exposed through TileLang cluster-copy helpers.
+- Cluster rank, arrive, wait, and sync helpers are part of the language frontend.
+- Cluster barrier allocation follows the same shared-memory barrier model used by other TileLang synchronization APIs.
+- CUDA lowering provides the TMA multicast, SM-to-SM copy, and cluster-store codegen paths described above.

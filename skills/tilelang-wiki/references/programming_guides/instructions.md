@@ -1,260 +1,435 @@
 # Instructions
 
-This page summarizes the core TileLang “instructions” available at the DSL
-level, how they map to hardware concepts, and how to use them correctly.
+This guide summarizes the TileLang instruction surface that appears in the
+current implementation and in the working examples. The most reliable pattern is
+to write kernels with high-level tile operations first, then use explicit
+low-level instructions only when a kernel needs manual scheduling.
 
-## Quick Categories
-- Data movement: `T.copy`, `T.async_copy`, `T.tma_copy`, `T.c2d_im2col`, staging Global ↔ Shared ↔ Fragment
-- Compute primitives: `T.gemm`/`T.gemm_sp`, elementwise math (`T.exp`, `T.max`),
-  reductions (`T.reduce_sum`, `T.cumsum`, warp reducers)
-- Control helpers: `T.clear`/`T.fill`, `T.reshape`/`T.view`
-- Diagnostics: `T.print`, `T.device_assert`
-- Advanced: atomics, memory barriers, warp‑group ops
+Implementation anchors:
+- `import tilelang.language.copy_op`
+- `import tilelang.language.allocate`
+- `import tilelang.language.gemm_op`
+- `import tilelang.language.reduce_op`
+- `import tilelang.language.atomic`
+
+Example anchors:
+- `examples/gemm/example_gemm.py`
+- `examples/gemm/example_gemm_autotune.py`
+- `examples/quickstart.py`
+- `examples/online_softmax/online_softmax.py`
+- `examples/gemm_splitk/example_tilelang_gemm_splitk.py`
+
+## Context
+
+This guide assumes the surrounding kernel structure introduced in
+`language_basics.md`: a `@tilelang.jit` or `@T.prim_func` kernel, a launch
+region created with `T.Kernel(...)`, explicit memory-scope allocations, and a
+small number of tile operations inside the kernel body.
+
+The examples below focus on instruction behavior rather than on the whole kernel
+around them.
 
 ## Data Movement
 
-Use `T.copy(src, dst, *, coalesced_width=None, disable_tma=False, eviction_policy=None, loop_layout=None)`
-to move tiles between memory scopes. It accepts `tir.Buffer`, `BufferLoad`, or
-`BufferRegion`; extents are inferred or broadcast when possible.
+### `T.copy`
 
 ```python
-# Global → Shared tiles (extents inferred from dst)
-T.copy(A[by * BM, ko * BK], A_s)
-T.copy(B[ko * BK, bx * BN], B_s)
-
-# Fragment/Register → Global (store result)
-T.copy(C_f, C[by * BM, bx * BN])
+T.copy(src, dst, *,
+       coalesced_width=None,
+       disable_tma=False,
+       eviction_policy=None,
+       annotations=None,
+       loop_layout=None)
 ```
 
-Semantics
-- Extents are deduced from arguments; missing sides broadcast to the other’s rank.
-- Access patterns are legalized and coalesced during lowering. Explicit
-  vectorization is not required in HL mode.
-- Safety: the LegalizeSafeMemoryAccess pass inserts boundary guards when an
-  access may be out‑of‑bounds and drops them when proven safe.
+`T.copy` is the default instruction for moving a tile between buffers or buffer
+regions. It accepts a `Buffer`, `BufferRegion`, or `BufferLoad` on either side.
 
-### Lowering `T.copy` to variants of copy mechanisms
+Common uses:
 
-TileLang supports both synchronous and explicitly-asynchronous copies.
-
-`T.copy(src, dst, ...)` (synchronous semantics)
-- Intended default for most TileLang programs.
-- The compiler is free to lower it to different mechanisms (synchronous SIMT copy `ld.global`, warp-level copy     `ldmatrix`, async copy via TMA `cp.async.bulk`, old async copy `cp.async`, etc.) depending on target/hints, but the   observable semantics
-  are *synchronous*: after the statement, it is safe to use `dst`.
-- If `T.copy` lowers to `cp.async`, TileLang will still preserve synchronous
-  semantics by emitting the required `commit`/`wait` (and any required
-  synchronization) so that consuming `dst` is correct.
-
-`T.async_copy(src, dst, ...)` (explicit async semantics)
-- Intended for writing manual pipelines or warp-specialized code where you want
-  to overlap global->shared copies with compute.
-- Lowers through `cp.async` and emits:
-  - `ptx_cp_async(...)`
-  - `ptx_commit_group()`
-  - No `ptx_wait_group(...)` is auto-inserted.
-- You must explicitly insert `T.ptx_wait_group(...)` before consuming `dst`.
-- A barrier is still required when `dst` is produced cooperatively and consumed
-  across threads. In most TileLang programs you do not need to write it
-  manually: `ThreadSync("shared")` will insert the required
-  `T.tvm_storage_sync("shared")` before the first read from `dst`. If you want
-  explicit control (or if you're writing very low-level code), you can insert
-  `T.tvm_storage_sync("shared")` yourself (or `T.tvm_storage_sync("warp")` for
-  warp-local consumption).
-- This op is intentionally strict: if the copy cannot be lowered to `cp.async`
-  (e.g., wrong scopes, unsupported vector width), compilation fails instead of
-  silently falling back to a synchronous copy.
-
-Example (manual async prefetch)
 ```python
-# Prefetch into shared asynchronously (emits cp.async + commit).
-T.async_copy(A[by * BM, ko * BK], A_s)
+T.copy(A[by * block_M, k * block_K], A_shared)
+T.copy(B[k * block_K, bx * block_N], B_shared)
+T.copy(C_local, C[by * block_M, bx * block_N])
+```
 
-# ... independent work here ...
+Important behavior from the implementation:
+- If both arguments are full buffers, their shapes must be structurally equal.
+- If both arguments are scalar `BufferLoad`s with no region extent, TileLang
+  lowers the operation to a direct scalar store.
+- Otherwise, TileLang tries to infer extents from the arguments and legalize
+  them pairwise. Missing extents are treated as size-1 dimensions. This is
+  limited syntactic sugar, not general NumPy-style broadcasting.
+- `coalesced_width`, `disable_tma`, `eviction_policy`, and `loop_layout` are
+  passed as annotations to the lowering pipeline. `annotations={...}` takes
+  precedence over the individual keyword arguments.
 
-# Before consuming A_s, ensure the async copies are completed.
+Use `T.copy` for ordinary global/shared/fragment movement unless you are writing
+an explicitly asynchronous pipeline.
+
+### `T.async_copy`
+
+```python
+T.async_copy(src, dst, *, coalesced_width=None,
+             annotations=None, loop_layout=None)
+```
+
+`T.async_copy` is the explicit `cp.async` path for asynchronous global-to-shared
+copy. The Python frontend emits a `tl.tileop.async_copy` operation; the backend
+is expected to lower it through `ptx_cp_async` and commit a copy group.
+
+The key semantic difference from `T.copy` is synchronization: `T.async_copy` does
+not wait for the data before the next statement. Insert an explicit wait before
+consuming the destination.
+
+```python
+T.async_copy(A[by * block_M, k * block_K], A_shared)
+
+# independent work here
+
 T.ptx_wait_group(0)
-# The required shared-memory barrier will be inserted automatically before the
-# first read from A_s by ThreadSync("shared") in the default lowering pipeline.
-T.gemm(A_s, B_s, C_f)
+T.sync_threads()
+T.gemm(A_shared, B_shared, C_local)
 ```
 
-Other helpers
-- `T.c2d_im2col(img, col, ...)`: convenience for conv‑style transforms.
+Use this only when you are intentionally managing overlap. For normal software
+pipelined loops, prefer `T.copy` inside `T.Pipelined(...)`.
 
-## Compute Primitives
-
-GEMM and sparse GEMM
-- `T.gemm(A_shared, B_shared, C_fragment)`: computes a tile GEMM using shared
-  inputs and a fragment accumulator; lowered to target‑specific tensor cores.
-- `T.gemm_sp(...)`: 2:4 sparse tensor core variant (see examples and README).
-
-Reductions and scans
-- `T.reduce_sum`, `T.reduce_max`, `T.reduce_min`, `T.cumsum`, plus warp
-  reducers (`T.warp_reduce_sum`, etc.).
-- Allocate and initialize accumulators via `T.alloc_fragment` + `T.clear` or
-  `T.fill`.
-
-Elementwise math
-- Most math ops mirror TVM TIR: `T.exp`, `T.log`, `T.max`, `T.min`, `T.rsqrt`,
-  `T.sigmoid`, etc. Compose freely inside loops.
-
-Reshape/view (no copy)
-- `T.reshape(buf, new_shape)` and `T.view(buf, shape=None, dtype=None)` create
-  new views that share storage, with shape/dtype checks enforced.
-
-## Synchronization (HL usage)
-
-In HL pipelines, you usually don’t need to write explicit barriers. Passes such
-as PipelinePlanning/InjectSoftwarePipeline/InjectTmaBarrier orchestrate
-producer/consumer ordering and thread synchronization behind the scenes.
-
-If you need debugging or explicit checks:
-- `T.device_assert(cond, msg='')` emits device‑side asserts on CUDA targets.
-- `T.print(obj, msg='...')` prints scalars or buffers safely from one thread.
-
-## Putting It Together: GEMM Tile
+### `T.tma_copy`
 
 ```python
-@T.prim_func
-def gemm(
-    A: T.Tensor((M, K), 'float16'),
-    B: T.Tensor((K, N), 'float16'),
-    C: T.Tensor((M, N), 'float16'),
-):
-    with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
-        A_s = T.alloc_shared((BM, BK), 'float16')
-        B_s = T.alloc_shared((BK, BN), 'float16')
-        C_f = T.alloc_fragment((BM, BN), 'float32')
-        T.clear(C_f)
-
-        for ko in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
-            T.copy(A[by * BM, ko * BK], A_s)  # Global → Shared
-            T.copy(B[ko * BK, bx * BN], B_s)
-            T.gemm(A_s, B_s, C_f)             # compute into fragment
-
-        T.copy(C_f, C[by * BM, bx * BN])      # store back
+T.tma_copy(src, dst, *, barrier=None,
+           eviction_policy=None, annotations=None)
 ```
 
-## Instruction Reference (Concise)
+`T.tma_copy` exposes an explicit TMA producer operation. It is used by advanced
+SM90/SM100 and warp-specialized examples such as:
 
-Below is a concise list of TileLang instructions grouped by category. For full
-signatures, behaviors, constraints, and examples, refer to API Reference
-(`autoapi/tilelang/index`).
+- `examples/gemm_sm100/gemm_tcgen5mma_ws.py`
+- `examples/blockscaled_gemm_sm100/gemm_mxfp8_blockscaled_1d1d.py`
+- `examples/warp_specialize/example_warp_specialize_gemm_softpipe_stage2.py`
 
-Data movement
-- `T.copy(src, dst, ...)`: Move tiles between Global/Shared/Fragment.
-- `T.async_copy(src, dst, ...)`: Explicit async global→shared copy via `cp.async`.
-- `T.tma_copy(src, dst, ...)`: Explicit async global→shared copy via `cp.async.bulk`
-- `T.transpose(src, dst)`: Transpose a 2D shared buffer: `dst[j, i] = src[i, j]`.
-- `T.c2d_im2col(img, col, ...)`: 2D im2col transform for conv.
+For global-to-shared loads, pass a barrier allocated with `T.alloc_barrier(...)`:
 
-Memory allocation and descriptors
-- `T.alloc_shared(shape, dtype, scope='shared.dyn')`: Allocate shared buffer.
-- `T.alloc_fragment(shape, dtype, scope='local.fragment')`: Allocate fragment.
-- `T.alloc_var(dtype, [init], scope='local.var')`: Scalar var buffer (1 elem).
-- `T.alloc_barrier(arrive_count)`: Allocate and initialize one or more mbarriers.
-- `T.alloc_tmem(shape, dtype)`: Tensor memory (TMEM) buffer (Blackwell+).
-- `T.deallocate_tmem(buffer)`: Explicitly release a TMEM buffer at the current site.
-- `T.alloc_reducer(shape, dtype, op='sum', replication=None)`: Reducer buf.
-- `T.alloc_descriptor(kind, dtype)`: Generic descriptor allocator.
-  - `T.alloc_wgmma_desc(dtype='uint64')`
-  - `T.alloc_tcgen05_smem_desc(dtype='uint64')`
-  - `T.alloc_tcgen05_instr_desc(dtype='uint32')`
-- `T.empty(shape, dtype='float32')`: Declare function output tensors.
+```python
+mbars = T.alloc_barrier([128, 128])
+T.tma_copy(A[by * block_M, ko * block_K], A_shared, barrier=mbars[0])
+```
 
-Compute primitives
-- `T.gemm(A_s, B_s, C_f)`: Tile GEMM into fragment accumulator.
-- `T.gemm_sp(...)`: Sparse (2:4) tensor core GEMM.
-- Reductions: `T.reduce_sum/max/min/abssum/absmax`, bitwise `and/or/xor`.
-- Scans: `T.cumsum`, finalize: `T.finalize_reducer`.
-- Warp reducers: `T.warp_reduce_sum/max/min/bitand/bitor`.
-- Elementwise math: TIR ops (`T.exp`, `T.log`, `T.max`, `T.min`, `T.rsqrt`, ...).
-- Fast math: `T.__log/__log2/__log10/__exp/__exp2/__exp10/__sin/__cos/__tan`.
-- IEEE math: `T.ieee_add/sub/mul/fmaf` (configurable rounding).
-- Helpers: `T.clear(buf)`, `T.fill(buf, value)`.
-- Views: `T.reshape(buf, shape)`, `T.view(buf, shape=None, dtype=None)`.
+The implementation documents this as user-managed synchronization:
+- TMA loads issue the producer side and require a barrier.
+- TMA stores omit the final wait so multiple stores can be batched before an
+  explicit wait.
 
-Diagnostics
-- `T.print(obj, msg='')`: Print scalar/buffer from one thread.
-- `T.device_assert(cond, msg='')`: Device-side assert (CUDA).
+If you do not need that control, use `T.copy` and let the lowering pipeline
+choose legal copy mechanisms.
 
-Logical helpers
-- `T.any_of(a, b, ...)`, `T.all_of(a, b, ...)`: Multi-term predicates.
+### Other Movement Helpers
 
-Annotation helpers
-- `T.use_swizzle(panel_size=..., enable=True)`: Rasterization hint.
-- `T.annotate_layout({...})`: Attach explicit layouts to buffers.
-- `T.annotate_safe_value(var, ...)`: Safety/const hints.
-- `T.annotate_l2_hit_ratio(buf, ratio)`: Cache behavior hint.
+- `T.copy_cluster(...)`: cluster-aware copy for TMA multicast or SM-to-SM shared
+  memory copy. Use only in cluster/TMA kernels.
+- `T.transpose(src, dst)`: transposes a 2D buffer tile.
+- `T.c2d_im2col(...)`: image-to-column helper used by convolution-style kernels.
 
-Synchronization helpers
-- `T.sync_threads([barrier_id, arrive_count])`: Block-wide barrier (`__syncthreads()`).
-- `T.sync_warp([mask])`: Warp-wide barrier (`__syncwarp([mask])`).
-- `T.sync_grid()`: Cooperative grid barrier (requires cooperative launch).
-- `T.pdl_trigger()`: Signal programmatic launch completion for the current kernel.
-- `T.pdl_sync()`: Wait until kernel dependencies are satisfied.
+## Allocation
 
-Warp-vote / warp-ballot (CUDA ≥ 9 / HIP)
-- `T.any_sync(predicate[, mask])` → `int32`: Non-zero if ANY lane in `mask` has non-zero predicate (`__any_sync`). `mask` defaults to `0xFFFFFFFF`.
-- `T.all_sync(predicate[, mask])` → `int32`: Non-zero if ALL lanes in `mask` have non-zero predicate (`__all_sync`). `mask` defaults to `0xFFFFFFFF`.
-- `T.ballot_sync(predicate[, mask])` → `uint64`: Bitmask of lanes in `mask` with non-zero predicate. CUDA: `__ballot_sync` zero-extended to 64 bits; HIP: `__ballot` returns natively as `uint64`, covering all 64 wavefront lanes. `mask` defaults to `0xFFFFFFFF`.
-- `T.ballot(predicate)` → `uint64`: Full-warp/wavefront ballot (mask = `0xFFFFFFFF`). No truncation on HIP.
-- `T.activemask()` → `uint64`: Bitmask of currently active lanes. CUDA: `__activemask` zero-extended to 64 bits; HIP: `__ballot(1)` as `uint64`.
+The common allocation instructions are:
 
-Block-wide predicated sync
-- `T.syncthreads_count(predicate)` → `int32`: Sync all threads; return count with non-zero predicate (`__syncthreads_count`).
-- `T.syncthreads_and(predicate)` → `int32`: Sync; non-zero iff ALL threads have non-zero predicate (`__syncthreads_and`).
-- `T.syncthreads_or(predicate)` → `int32`: Sync; non-zero iff ANY thread has non-zero predicate (`__syncthreads_or`).
+```python
+A_shared = T.alloc_shared((block_M, block_K), dtype)
+C_local = T.alloc_fragment((block_M, block_N), T.float32)
+tmp = T.alloc_local((block_M,), T.float32)
+scalar = T.alloc_var("int32", init=0)
+```
 
-Warp-shuffle (intra-warp data exchange). All accept a trailing `mask` kwarg that defaults to `0xFFFFFFFF`.
-- `T.shfl_sync(value, src_lane[, width, mask])`: Broadcast value from `src_lane` to all lanes (`__shfl_sync`).
-- `T.shfl_xor(value, delta[, width, mask])`: XOR-swap across lanes (`__shfl_xor_sync`).
-- `T.shfl_down(value, delta[, width, mask])`: Shift down by `delta` lanes (`__shfl_down_sync`).
-- `T.shfl_up(value, delta[, width, mask])`: Shift up by `delta` lanes (`__shfl_up_sync`).
+Use these by scope:
+- `T.alloc_shared(shape, dtype, scope="shared.dyn")`: shared memory tile. `bool`
+  uses `"shared"` internally because shared-memory merging does not handle bool.
+- `T.alloc_fragment(shape, dtype, scope="local.fragment")`: fragment/register
+  tile for tile operations such as GEMM and reductions.
+- `T.alloc_local(shape, dtype, scope="local")`: thread-local storage.
+- `T.alloc_var(dtype, init=None, scope="local.var")`: one-element scalar buffer.
+  It supports `T.alloc_var("int32", 1)`, `T.alloc_var("int32", init=1)`, and the
+  older positional scope form.
+- `T.alloc_global(shape, dtype, scope="global")`: global workspace allocated by
+  backend APIs. The source code warns that user-managed framework workspaces are
+  usually preferable.
+- `T.empty(shape, dtype=...)`: declares an eager-style output tensor that should
+  be returned by the JIT function.
 
-Warp-match (CUDA sm_70+, not supported on HIP). `mask` defaults to `0xFFFFFFFF`.
-- `T.match_any_sync(value[, mask])` → `uint32`: Bitmask of lanes in `mask` whose `value` matches the calling lane's (`__match_any_sync`).
-- `T.match_all_sync(value[, mask])` → `uint32`: Returns `mask` if all lanes in `mask` agree on `value`, else 0 (`__match_all_sync`). The C-level `int*` predicate output is hidden; reconstruct it as `result != 0`.
+Advanced allocation:
+- `T.alloc_barrier(arrive_count)` and `T.alloc_cluster_barrier(arrive_count)`:
+  allocate shared-memory barrier buffers. `arrive_count` can be an int or a list
+  of ints.
+- `T.alloc_tmem(shape, dtype)`: Blackwell tensor-memory buffer. Shape must be
+  2D and is intended for TCGEN5 MMA paths.
+- `T.alloc_reducer(shape, dtype, op="sum", replication=None)`: reducer buffer
+  for reductions inside parallel loops. Valid ops are `"sum"`, `"max"`, and
+  `"min"`; valid replication values are `"all"` and `"none"`.
+- Descriptor helpers: `T.alloc_wgmma_desc()`,
+  `T.alloc_tcgen05_smem_desc()`, and `T.alloc_tcgen05_instr_desc()`.
 
-> **Note on HIP:** `any_sync`/`all_sync` ignore the mask and call `__any`/`__all` directly. `ballot_sync`, `ballot`, and `activemask` call `__ballot` which returns `uint64` natively on 64-thread wavefronts — no truncation occurs. Shuffle intrinsics lower to `__shfl`/`__shfl_xor`/`__shfl_down`/`__shfl_up` (mask ignored). `syncthreads_count/and/or` have identical signatures on both platforms. `match_any_sync` and `match_all_sync` have no HIP equivalent and will fail to codegen on HIP.
+For the broader memory-scope model and the canonical minimal kernel skeleton,
+see `language_basics.md`. For dtype-specific allocation behavior, see
+`type_system.md`.
 
-Atomics
-- `T.atomic_add(dst, value, memory_order=None, return_prev=False, use_tma=False)`.
-- `T.atomic_addx2(dst, value, return_prev=False)`; `T.atomic_addx4(...)`.
-- `T.atomic_max(dst, value, memory_order=None, return_prev=False)`.
-- `T.atomic_min(dst, value, memory_order=None, return_prev=False)`.
-- `T.atomic_load(dst)`, `T.atomic_store(dst, value)`.
+## Compute
 
-Custom intrinsics
-- `T.dp4a(A, B, C)`: 4‑element dot‑product accumulate.
-- `T.clamp(x, lo, hi)`: Clamp to [lo, hi].
-- `T.loop_break()`: Break from current loop via intrinsic.
+### `T.gemm`
 
-Barriers, TMA, warp‑group
-- Barriers: `T.alloc_barrier(arrive_count)`.
-- Parity ops: `T.mbarrier_wait_parity(barrier, parity)`, `T.mbarrier_arrive(barrier)`.
-- Expect tx: `T.mbarrier_expect_tx(...)`; sugar: `T.barrier_wait(id, parity=None)`.
-- TMA: `T.create_tma_descriptor(...)`, `T.tma_load(...)`,
-  `T.tma_store_arrive(...)`, `T.tma_store_wait(...)`.
-- Proxy/fences: `T.fence_proxy_async(...)`, `T.warpgroup_fence_operand(...)`.
-- Warp‑group: `T.warpgroup_arrive()`, `T.warpgroup_commit_batch()`,
-  `T.warpgroup_wait(num_mma)`, `T.wait_wgmma(id)`.
+```python
+T.gemm(A_shared, B_shared, C_local,
+       transpose_A=False,
+       transpose_B=False,
+       policy=T.GemmWarpPolicy.Square,
+       clear_accum=False,
+       k_pack=1,
+       mbar=None)
+```
 
-Lane/warp index
-- `T.get_lane_idx(warp_size=None)`: Lane id in warp.
-- `T.get_warp_idx_sync(warp_size=None)`: Canonical warp id (sync).
-- `T.get_warp_idx(warp_size=None)`: Canonical warp id (no sync).
-- `T.get_warp_group_idx(warp_size=None, warps_per_group=None)`: Group id.
+`T.gemm` is the default synchronous tile GEMM instruction. It selects the backend
+implementation during lowering:
+- CUDA paths use MMA/WGMMA/TCGEN5 depending on target and operand pattern.
+- HIP paths use MFMA-style lowering.
+- If WGMMA or TCGEN5 is selected, the high-level `T.gemm` path inserts the
+  corresponding wait implicitly.
 
-Register control
-- `T.set_max_nreg(reg_count, is_inc)`, `T.inc_max_nreg(n)`, `T.dec_max_nreg(n)`.
-- `T.annotate_producer_reg_dealloc(n=24)`, `T.annotate_consumer_reg_alloc(n=240)`.
-- `T.no_set_max_nreg()`, `T.disable_warp_group_reg_alloc()`.
+Use `transpose_B=True` when the shared B tile is stored as `(block_N, block_K)`,
+as in `examples/gemm/example_gemm_autotune.py`:
 
-## Notes on Dtypes
+```python
+T.copy(B[bx * block_N, k * block_K], B_shared)
+T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+```
 
-Dtypes accept three equivalent forms:
-- String: `'float32'`
-- TileLang dtype: `T.float32`
-- Framework dtype: `torch.float32`
-All are normalized internally. See Type System for details.
+Use `policy=T.GemmWarpPolicy.FullRow` for attention-style row-oriented GEMM
+patterns, as shown in the flash-attention examples.
+
+Manual asynchronous GEMM exists for specialist kernels:
+- `T.wgmma_gemm(...)` plus `T.wait_wgmma(...)` on Hopper.
+- `T.tcgen05_gemm(...)` plus mbarrier waits on Blackwell.
+
+Start with `T.gemm` unless the example you are following already uses the manual
+form.
+
+For the common pipelined GEMM loop structure, see `software_pipeline.md`. For
+tuned GEMM kernels that vary block sizes and `num_stages`, see `autotuning.md`.
+
+### Elementwise Work
+
+Use `T.Parallel(...)` to apply elementwise operations across a tile:
+
+```python
+for i, j in T.Parallel(block_M, block_N):
+    C_local[i, j] = T.max(C_local[i, j], 0)
+```
+
+This is the pattern in `examples/quickstart.py`. Common scalar math functions
+come from the TIR/TileLang language namespace, including `T.exp`, `T.log`,
+`T.sqrt`, `T.rsqrt`, `T.max`, `T.min`, `T.if_then_else`, `T.infinity`, and
+`T.clamp`.
+
+`T.clear(buf)` and `T.fill(buf, value)` are convenience forms for setting all
+elements in a tile.
+
+### Reductions and Scans
+
+Reduction functions take an input buffer, an output buffer, a dimension, and a
+`clear` flag:
+
+```python
+T.reduce_sum(A_pow_local, A_powsum, dim=1)
+T.reduce_max(x, max_x, dim=1, clear=True)
+T.reduce_absmax(y_local, y_amax_local, dim=1)
+```
+
+Supported high-level reductions:
+- `T.reduce_sum`
+- `T.reduce_max`
+- `T.reduce_min`
+- `T.reduce_abssum`
+- `T.reduce_absmax`
+- `T.reduce_bitand`
+- `T.reduce_bitor`
+- `T.reduce_bitxor`
+
+Implementation details:
+- Negative `dim` values are legalized against the input rank.
+- Output shape must match the input shape with the reduced dimension removed,
+  or with that dimension kept as extent 1.
+- Reductions accept fragment and shared buffers. When needed, TileLang creates
+  fragment temporaries and copies between scopes.
+- `batch > 1` batches multiple output elements per all-reduce call. It must be
+  compatible with the output element count.
+- `nan_propagate=True` is supported for max/min/absmax on CUDA float16/bfloat16
+  paths.
+
+`T.cumsum(src, dst=None, dim=..., reverse=False)` computes cumulative sums. The
+GDN cumsum example uses both fragment and shared inputs:
+
+```python
+T.cumsum(G_fragment, dim=1, reverse=reverse)
+T.cumsum(G_shared, dim=1, reverse=reverse)
+```
+
+Warp reducers are scalar intrinsics:
+- `T.warp_reduce_sum(value)`
+- `T.warp_reduce_max(value)`
+- `T.warp_reduce_min(value)`
+- `T.warp_reduce_bitand(value)`
+- `T.warp_reduce_bitor(value)`
+
+## Views
+
+`T.reshape(buffer, shape)` and `T.view(buffer, shape=None, dtype=None)` create a
+new view of the same storage. Examples use this to reinterpret shared buffers
+before reducing:
+
+```python
+s_reshaped = T.reshape(s, (block_N, block_Q, heads))
+acc_dkv = T.view(KV_shared, shape=[BS // split_store, D], dtype=accum_dtype)
+```
+
+Use these when the storage layout is already correct and only the logical shape
+or dtype view changes.
+
+## Atomics
+
+Common atomics:
+
+```python
+T.atomic_add(dst, value, memory_order=None,
+             return_prev=False, use_tma=False)
+T.atomic_max(dst, value, memory_order=None, return_prev=False)
+T.atomic_min(dst, value, memory_order=None, return_prev=False)
+```
+
+`T.atomic_add` is used heavily in split-K GEMM and backward kernels:
+
+```python
+for i, j in T.Parallel(block_M, block_N):
+    T.atomic_add(C[by * block_M + i, bx * block_N + j], C_local[i, j])
+```
+
+Implementation-backed constraints:
+- Scalar/addressed atomics use extern element intrinsics. `return_prev=True` is
+  supported on this scalar path.
+- Tile-region atomics infer and legalize extents like `T.copy`.
+- `return_prev=True` is not supported for tile-region atomics.
+- Memory order strings are `"relaxed"`, `"consume"`, `"acquire"`, `"release"`,
+  `"acq_rel"`, and `"seq_cst"`.
+- `use_tma=True` on `atomic_add` requests a TMA/cp.reduce path where supported.
+
+Vectorized atomics such as `T.atomic_addx2` and `T.atomic_addx4` appear in some
+DeepSeek examples and should be treated as low-level optimization tools.
+
+## Synchronization
+
+Most high-level kernels rely on the compiler pipeline to insert necessary
+producer/consumer synchronization around shared-memory tile operations. Add
+explicit synchronization when you use manual async copies, custom shared-memory
+protocols, or atomic/shared-memory staging.
+
+Common sync instructions:
+
+```python
+T.sync_threads()
+T.sync_threads(barrier_id, arrive_count)
+T.sync_warp()
+T.sync_warp(mask)
+T.sync_grid()
+```
+
+Advanced barrier/TMA instructions include:
+- `T.alloc_barrier(...)`
+- `T.mbarrier_wait_parity(...)`
+- `T.mbarrier_arrive(...)`
+- `T.mbarrier_expect_tx(...)`
+- `T.tma_store_arrive(...)`
+- `T.tma_store_wait(...)`
+- `T.fence_proxy_async(...)`
+
+Warp-group instructions include:
+- `T.warpgroup_arrive()`
+- `T.warpgroup_commit_batch()`
+- `T.warpgroup_wait(num_mma)`
+- `T.wait_wgmma(id)`
+
+## Warp Intrinsics
+
+TileLang exposes CUDA/HIP-style warp helpers:
+
+- Vote/ballot: `T.any_sync`, `T.all_sync`, `T.ballot_sync`, `T.ballot`,
+  `T.activemask`.
+- Shuffle: `T.shfl_sync`, `T.shfl_xor`, `T.shfl_down`, `T.shfl_up`.
+- Match: `T.match_any_sync`, `T.match_all_sync` on CUDA targets that support
+  them.
+- Block-wide predicates: `T.syncthreads_count`, `T.syncthreads_and`,
+  `T.syncthreads_or`.
+
+These are low-level tools. Prefer tile reductions when reducing full tiles.
+
+## Diagnostics
+
+`T.print(obj, msg="", warp_group_id=0, warp_id=0)` prints scalars or buffers and
+dispatches to different helpers for global, shared, local, and fragment buffers.
+The buffer-print helpers gate output by selected warp/group IDs where that is
+implemented; scalar-expression printing is a direct print intrinsic and should
+not be described as "one thread only" behavior.
+
+`T.device_assert(condition, msg="", no_stack_info=False)` emits a device-side
+assert. The sparse utility code uses this to validate metadata invariants.
+
+Use both sparingly; they affect generated code and runtime behavior.
+
+## Annotations and Hints
+
+Common hints:
+
+```python
+T.use_swizzle(panel_size=10, enable=True)
+T.annotate_layout({...})
+T.annotate_safe_value(var, ...)
+T.annotate_l2_hit_ratio(buf, ratio)
+```
+
+`T.use_swizzle` is common in GEMM examples to improve L2 locality:
+
+```python
+T.use_swizzle(panel_size=10, enable=enable_rasteration)
+```
+
+Pass configs can also affect instruction lowering. For example, many attention
+examples enable fast math:
+
+```python
+@tilelang.jit(
+    out_idx=[3],
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+)
+```
+
+## Dtypes
+
+TileLang accepts dtype strings and TileLang dtype constants:
+
+```python
+dtype = "float16"
+dtype = T.float16
+accum_dtype = T.float32
+```
+
+Examples generally use `T.float16`, `T.bfloat16`, and `T.float32` in kernel
+factories. Dtypes are normalized internally before lowering.
+
+## Practical Guidance
+
+- Start from a working example with the same dataflow. For GEMM, copy the
+  `example_gemm.py` structure. For tuned GEMM, copy `example_gemm_autotune.py`.
+- Prefer `T.copy`, `T.gemm`, `T.reduce_*`, and `T.Parallel` before reaching for
+  manual TMA, WGMMA, or barrier instructions.
+- Treat region inference as convenience syntax, not full broadcasting.
+- Put explicit waits/barriers next to explicit async instructions so the data
+  dependency is obvious in the source.
+- Keep accumulator dtypes explicit. Most GEMM and attention examples accumulate
+  in `T.float32` even when inputs and outputs are fp16/bf16.

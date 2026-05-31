@@ -92,6 +92,6 @@ For the surrounding host-side setup, correctness check, and benchmarking flow,
 see `../../examples/gemm_sp/example_gemm_sp.py`.
 
 For the maintained background on the underlying primitives, also see
-[Language Basics](../programming_guides/language_basics.md),
-[GEMM APIs](../programming_guides/tilelang_language/gemm_op/basic.md), and
-[loop APIs](../programming_guides/tilelang_language/loop/basic.md).
+[Language Basics](../language_basics.md),
+[GEMM APIs](../tilelang_language/gemm_op/basic.md), and
+[loop APIs](../tilelang_language/loop/basic.md).

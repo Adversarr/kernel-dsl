@@ -119,7 +119,7 @@ for k in T.Pipelined(loop_range, num_stages=2):
     ...
 ```
 
-Multi-stage pipelining enables overlapping of computation and memory access, which can significantly improve performance for memory-intensive operators. However, setting a higher number of stages consumes more shared memory resources, so the optimal configuration needs to be determined based on specific use cases. For the maintained semantics of `T.Pipelined`, see [Loop APIs](../programming_guides/tilelang_language/loop/basic.md) and [advanced loop controls](../programming_guides/tilelang_language/loop/advanced.md).
+Multi-stage pipelining enables overlapping of computation and memory access, which can significantly improve performance for memory-intensive operators. However, setting a higher number of stages consumes more shared memory resources, so the optimal configuration needs to be determined based on specific use cases. For the maintained semantics of `T.Pipelined`, see [Loop APIs](../tilelang_language/loop/basic.md) and [advanced loop controls](../tilelang_language/loop/advanced.md).
 
 ### Split-KV
 
@@ -135,9 +135,9 @@ The maintained source files for this operator family are:
 - `../../examples/deepseek_mla/README.md`
 
 For the maintained language reference behind these kernels, see
-[Language Basics](../programming_guides/language_basics.md),
-[GEMM APIs](../programming_guides/tilelang_language/gemm_op/basic.md), and
-[loop APIs](../programming_guides/tilelang_language/loop/basic.md).
+[Language Basics](../language_basics.md),
+[GEMM APIs](../tilelang_language/gemm_op/basic.md), and
+[loop APIs](../tilelang_language/loop/basic.md).
 
 ## 🚀 On AMD MI300X Accelerators
 

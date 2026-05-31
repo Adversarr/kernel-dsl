@@ -20,7 +20,7 @@ TileLang is a domain-specific language (DSL) designed for writing high-performan
 
 Figure 1 from the original blog post is omitted here because the `_static` asset
 path is not part of this self-contained skill package. For the maintained
-high-level compiler walk-through, see [Programming Guides Overview](../programming_guides/overview.md).
+high-level compiler walk-through, see [TileLang Reference Guide](../README.md).
 
 In this tutorial, we introduce Level 2 with a matrix multiplication example in TileLang. We will walk through how to allocate shared memory, set up thread blocks, perform parallel copying, pipeline the computation, and invoke the tile-level GEMM intrinsic. We will then show how to compile and run the kernel in Python, comparing results and measuring performance.
 
@@ -114,7 +114,7 @@ with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx,
 
 The original parallel-mapping figure is omitted here because the `_static` asset
 is not included in this skill package. For the maintained explanation of launch
-regions and thread mapping, see [Language Basics](../programming_guides/language_basics.md).
+regions and thread mapping, see [Language Basics](../language_basics.md).
 
 2. **Shared & Fragment Memory**:
 
@@ -139,8 +139,8 @@ for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
 
 The original software-pipeline figure is omitted here because the `_static`
 asset is not included in this skill package. For the maintained explanation of
-`T.Pipelined`, see [Loop APIs](../programming_guides/tilelang_language/loop/basic.md)
-and [advanced loop controls](../programming_guides/tilelang_language/loop/advanced.md).
+`T.Pipelined`, see [Loop APIs](../tilelang_language/loop/basic.md)
+and [advanced loop controls](../tilelang_language/loop/advanced.md).
 
 4. **Parallel Copy**:
 
@@ -208,10 +208,10 @@ For more advanced usage—including partial lowering, explicitly controlling thr
 
 ## Further Resources
 
-- [Programming Guides Overview](../programming_guides/overview.md)
-- [Language Basics](../programming_guides/language_basics.md)
-- [Loop APIs](../programming_guides/tilelang_language/loop/basic.md)
-- [GEMM APIs](../programming_guides/tilelang_language/gemm_op/basic.md)
+- [TileLang Reference Guide](../README.md)
+- [Language Basics](../language_basics.md)
+- [Loop APIs](../tilelang_language/loop/basic.md)
+- [GEMM APIs](../tilelang_language/gemm_op/basic.md)
 - [Current GEMM Example](../../examples/gemm/example_gemm.py)
 - [TileLang GitHub](https://github.com/tile-ai/tilelang)
 - [BitBLAS](https://github.com/tile-ai/bitblas)

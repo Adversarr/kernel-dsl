@@ -41,11 +41,13 @@ Start with:
 - `references/README.md` for the compact language overview, quick API reference, kernel templates, and routing to deeper guides
 - `examples/README.md` for the example catalogue and operator-family lookup
 
-Open `references/programming_guides/overview.md` early to route through the
-new guide structure. Use `references/programming_guides/language_basics.md`
-for the compact language cheatsheet, `references/programming_guides/jit_autotune.md`
-for compile/tuning basics, and `references/programming_guides/python_compat.md`
-for supported Python syntax, shapes, tensors, dtypes, and casts.
+Open `references/README.md`, `references/language_basics.md`, and
+`references/jit_autotune.md` early in development. They are the short path for
+the current guide structure, basic kernel syntax, and compile/tuning workflow.
+Use `references/tilelang/README.md` for top-level `tilelang.*` APIs and
+`references/tilelang_language/README.md` for exact `tilelang.language as T`
+APIs. Use `references/python_compat.md` for supported Python syntax, shapes,
+tensors, dtypes, and casts.
 
 Open `FAQs.md` early when the user reports a concrete compiler error, profiler
 surprise, autotuning failure, or an example that compiles but does not validate
@@ -96,7 +98,7 @@ Route by user intent, not by file tree.
    - debugging
    - internals
 2. Open `references/README.md` first for the compact overview, quick API table, and template shape.
-3. Open `references/programming_guides/language_basics.md` next for fast DSL basics, then route to `references/programming_guides/tilelang_language/README.md` for exact `T.*` APIs.
+3. Open `references/language_basics.md` next for fast DSL basics, then route to `references/tilelang_language/README.md` for exact `T.*` APIs.
 4. Open `examples/README.md` when the user needs a matching runnable example.
 5. Open `FAQs.md` when the task sounds like a known failure mode or a practical
    "why did this happen?" question.
@@ -107,7 +109,7 @@ Route by user intent, not by file tree.
 
 - Prefer practical guidance over file dumps.
 - Use `references/README.md` for conceptual explanation and `examples/README.md` for locating the right example family.
-- Use `references/README.md` for fast API lookup, then `references/programming_guides/overview.md` to choose between the cheatsheets and the `tilelang/` or `tilelang_language/` API detail pages.
+- Use `references/README.md` for fast routing between the cheatsheets and the `tilelang/` or `tilelang_language/` API detail pages.
 - If docs and examples overlap, use docs for semantics and examples for implementation patterns.
 - Surface target assumptions early, especially CUDA vs HIP/AMD and Hopper/Blackwell-specific behavior.
 - Separate semantic correctness from performance tuning.
@@ -118,8 +120,8 @@ Route by user intent, not by file tree.
 
 ## Important Caveats
 
-- The current programming-guide defaults are `overview.md`, `language_basics.md`, `jit_autotune.md`, `python_compat.md`, `tilelang/README.md`, and `tilelang_language/README.md`.
-- Older narrative programming guides live under `references/programming_guides/old/`; use them as archived background only after checking the newer cheatsheets and API references.
+- The current guide defaults are `references/README.md`, `references/language_basics.md`, `references/jit_autotune.md`, `references/python_compat.md`, `references/tilelang/README.md`, and `references/tilelang_language/README.md`.
+- Older narrative programming guides live under `references/old_programming_guiles/`; use them as archived background only after checking the newer cheatsheets and API references.
 - Some useful pages are not part of the original top-level toctree, especially `references/runtime_internals/stubs.md`; still use them when relevant.
 - The local example tree is broad and evolves faster than prose docs, so prefer `examples/README.md` to choose an operator family and then open the specific example directory or README.
 - `FAQs.md` is intentionally issue-driven and may mention pitfalls not yet

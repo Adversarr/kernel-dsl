@@ -17,7 +17,7 @@ Elementwise operators are widely used in deep learning and often serve as the fi
 3. How TileLang addresses boundary-related issues.
 4. The similarities and differences between operators implemented in TileLang and those implemented in CUDA/CuTe.
 
-Please note that this tutorial does not delve deeply into the design principles of TileLang. For a broader understanding of TileLang, we recommend consulting the [Programming Guides Overview](../programming_guides/overview.md) and [Language Basics](../programming_guides/language_basics.md).
+Please note that this tutorial does not delve deeply into the design principles of TileLang. For a broader understanding of TileLang, we recommend consulting the [TileLang Reference Guide](../README.md) and [Language Basics](../language_basics.md).
 
 ## Elementwise add in TileLang
 

@@ -461,4 +461,4 @@ Triton Time: 0.0077344514429569244
 
 This tutorial focused on the thread-level GEMV progression. For the current in-repo source, also review `gemv_alloc_reducer` in `../../examples/gemv/example_gemv.py`, which shows how the same operator family can also be expressed with tile-level fragments, reducers, and a pipelined loop.
 
-For related background, see [Language Basics](../programming_guides/language_basics.md), [loop APIs](../programming_guides/tilelang_language/loop/basic.md), [reduction APIs](../programming_guides/tilelang_language/reduce_op/basic.md), and [JIT/autotune basics](../programming_guides/jit_autotune.md).
+For related background, see [Language Basics](../language_basics.md), [loop APIs](../tilelang_language/loop/basic.md), [reduction APIs](../tilelang_language/reduce_op/basic.md), and [JIT/autotune basics](../jit_autotune.md).

@@ -101,14 +101,9 @@ target-specific, lower-level, or rarely used behavior.
 
 ## Other Reference Areas
 
-- setup and target selection:
-  - `get_started/Installation.md`
-  - `get_started/overview.md`
-  - `get_started/targets.md`
-- tutorials:
-  - `tutorials/auto_tuning.md`
-  - `tutorials/debug_tools_for_tilelang.md`
-  - `tutorials/logging.md`
+- distilled tutorials:
+  - `auto_tuning.md`
+  - `debug_tools_for_tilelang.md`
 - operator walkthroughs:
   - `deeplearning_operators/elementwise.md`
   - `deeplearning_operators/gemv.md`
@@ -118,11 +113,14 @@ target-specific, lower-level, or rarely used behavior.
 - practical details:
   - `god_blessing/magic_enums.md`
   - `god_blessing/pass_config.md`
-- compiler/runtime internals:
-  - `compiler_internals/letstmt_inline.md`
-  - `compiler_internals/inject_fence_proxy.md`
-  - `compiler_internals/tensor_checks.md`
-  - `runtime_internals/stubs.md`
+- archived setup, narrative guides, compiler internals, and runtime internals:
+  - `old_programming_guiles/get_started/Installation.md`
+  - `old_programming_guiles/get_started/overview.md`
+  - `old_programming_guiles/get_started/targets.md`
+  - `old_programming_guiles/compiler_internals/letstmt_inline.md`
+  - `old_programming_guiles/compiler_internals/inject_fence_proxy.md`
+  - `old_programming_guiles/compiler_internals/tensor_checks.md`
+  - `old_programming_guiles/runtime_internals/stubs.md`
 
 ## Practical Routing
 
@@ -132,8 +130,8 @@ target-specific, lower-level, or rarely used behavior.
   `tilelang_language/README.md`, then the relevant `basic.md`.
 - For tuning, start with `jit_autotune.md`, then use
   `tilelang/autotune/basic.md` only when you need the detailed API.
-- For debugging, start with `../FAQs.md`; use `tutorials/debug_tools_for_tilelang.md`
-  when you need AutoDD, source inspection, layout plotting, or generated-code
-  callbacks.
+- For debugging, start with `../FAQs.md`; use
+  `debug_tools_for_tilelang.md` when you need AutoDD, source inspection, layout
+  plotting, or generated-code callbacks.
 - For advanced hardware paths, start from the basic page, then open the
   matching `advanced.md` page only after the basic kernel is correct.

@@ -1,6 +1,6 @@
 ---
 name: "tilelang-wiki"
-description: "Answers TileLang DSL, kernel-writing, tuning, debugging, and operator questions from the bundled wiki/examples. Invoke when users ask how to write, understand, optimize, or debug TileLang kernels."
+description: "A local, code-grounded TileLang reference skill for DSL semantics, kernel authoring, API lookup, tuning, debugging, examples, and compiler/runtime behavior. Use whenever you need to write, modify, explain, optimize, validate, or troubleshoot TileLang programming work."
 ---
 
 # TileLang Wiki
@@ -121,8 +121,10 @@ Route by user intent, not by file tree.
 ## Important Caveats
 
 - The current guide defaults are `references/README.md`, `references/language_basics.md`, `references/jit_autotune.md`, `references/python_compat.md`, `references/tilelang/README.md`, and `references/tilelang_language/README.md`.
-- Older narrative programming guides live under `references/old_programming_guiles/`; use them as archived background only after checking the newer cheatsheets and API references.
-- Some useful pages are not part of the original top-level toctree, especially `references/runtime_internals/stubs.md`; still use them when relevant.
+- Older narrative guides, setup pages, compiler-internal notes, and
+  runtime-internal notes live under `references/old_programming_guiles/`; use
+  them as archived background only after checking the newer cheatsheets and API
+  references.
 - The local example tree is broad and evolves faster than prose docs, so prefer `examples/README.md` to choose an operator family and then open the specific example directory or README.
 - `FAQs.md` is intentionally issue-driven and may mention pitfalls not yet
   surfaced in the higher-level guides; use it for surgical debugging advice.

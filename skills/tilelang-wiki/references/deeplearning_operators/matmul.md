@@ -139,7 +139,8 @@ for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
 
 The original software-pipeline figure is omitted here because the `_static`
 asset is not included in this skill package. For the maintained explanation of
-`T.Pipelined`, see [Software Pipeline](../programming_guides/software_pipeline.md).
+`T.Pipelined`, see [Loop APIs](../programming_guides/tilelang_language/loop/basic.md)
+and [advanced loop controls](../programming_guides/tilelang_language/loop/advanced.md).
 
 4. **Parallel Copy**:
 
@@ -209,7 +210,8 @@ For more advanced usage—including partial lowering, explicitly controlling thr
 
 - [Programming Guides Overview](../programming_guides/overview.md)
 - [Language Basics](../programming_guides/language_basics.md)
-- [Software Pipeline](../programming_guides/software_pipeline.md)
+- [Loop APIs](../programming_guides/tilelang_language/loop/basic.md)
+- [GEMM APIs](../programming_guides/tilelang_language/gemm_op/basic.md)
 - [Current GEMM Example](../../examples/gemm/example_gemm.py)
 - [TileLang GitHub](https://github.com/tile-ai/tilelang)
 - [BitBLAS](https://github.com/tile-ai/bitblas)

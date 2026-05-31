@@ -22,6 +22,19 @@ Use this file first for:
 - common kernel templates and adaptation patterns
 - routing to deeper guides under `references/`
 
+Use the programming guides by intent:
+
+- fast references:
+  - `programming_guides/overview.md`
+  - `programming_guides/language_basics.md`
+  - `programming_guides/jit_autotune.md`
+  - `programming_guides/python_compat.md`
+- API details:
+  - `programming_guides/tilelang/README.md`
+  - `programming_guides/tilelang_language/README.md`
+- archived narrative guides:
+  - `programming_guides/old/`
+
 Use the rest of the local docs by intent:
 
 - setup and targets:
@@ -30,15 +43,16 @@ Use the rest of the local docs by intent:
   - `get_started/targets.md`
 - core DSL semantics:
   - `programming_guides/language_basics.md`
-  - `programming_guides/control_flow.md`
-  - `programming_guides/python_compatibility.md`
-  - `programming_guides/type_system.md`
+  - `programming_guides/tilelang_language/README.md`
+  - `programming_guides/python_compat.md`
 - instruction behavior and pipelining:
-  - `programming_guides/instructions.md`
-  - `programming_guides/software_pipeline.md`
-  - `programming_guides/cluster_tma.md`
+  - `programming_guides/tilelang_language/copy_op/basic.md`
+  - `programming_guides/tilelang_language/copy_op/advanced.md`
+  - `programming_guides/tilelang_language/gemm_op/basic.md`
+  - `programming_guides/tilelang_language/kernel_warpgroup_cluster_builtins/advanced.md`
 - tuning and debugging:
-  - `programming_guides/autotuning.md`
+  - `programming_guides/jit_autotune.md`
+  - `programming_guides/tilelang/README.md`
   - `tutorials/auto_tuning.md`
   - `tutorials/debug_tools_for_tilelang.md`
   - `tutorials/logging.md`
@@ -469,14 +483,18 @@ Open these pages next depending on the question:
 
 - language and kernel structure:
   - `programming_guides/language_basics.md`
-  - `programming_guides/control_flow.md`
-  - `programming_guides/python_compatibility.md`
+  - `programming_guides/python_compat.md`
+  - `programming_guides/tilelang_language/README.md`
 - instruction semantics:
-  - `programming_guides/instructions.md`
-  - `programming_guides/software_pipeline.md`
-  - `programming_guides/cluster_tma.md`
+  - `programming_guides/tilelang_language/README.md`
+  - `programming_guides/tilelang_language/copy_op/basic.md`
+  - `programming_guides/tilelang_language/gemm_op/basic.md`
+  - `programming_guides/tilelang_language/reduce_op/basic.md`
+  - `programming_guides/tilelang_language/kernel_warpgroup_cluster_builtins/advanced.md`
 - performance:
-  - `programming_guides/autotuning.md`
+  - `programming_guides/jit_autotune.md`
+  - `programming_guides/tilelang/autotune/basic.md`
+  - `programming_guides/tilelang/autotune/advanced.md`
   - `tutorials/auto_tuning.md`
 - debugging:
   - `tutorials/debug_tools_for_tilelang.md`

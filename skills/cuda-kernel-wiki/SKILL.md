@@ -1,5 +1,5 @@
 ---
-name: CUDA Kernel Wiki
+name: cuda-kernel-wiki
 description: Use when the user asks about CUDA kernel optimization, GPU memory hierarchy, kernel scheduling, GEMM or attention implementations, PTX or CUDA DSL techniques, or wants concrete PR-backed kernel references. The deepest coverage is NVIDIA Blackwell and Hopper, but the navigation patterns are useful for broader CUDA-kernel research.
 argument-hint: "[natural-language-question] | [--tag foo --type kernel] | [page-id]"
 allowed-tools: "Bash Read Grep Glob"
